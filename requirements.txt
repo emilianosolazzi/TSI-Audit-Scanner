@@ -1,0 +1,27 @@
+# Core dependencies
+requests>=2.28.0
+
+# Service mode
+flask>=2.3.0
+flask-cors>=4.0.0
+
+# Rate limiting for API
+flask-limiter>=3.5.0
+
+# Background tasks
+celery>=5.3.0
+redis>=5.0.0
+
+# Database for usage tracking
+sqlalchemy>=2.0.0
+
+# Authentication
+pyjwt>=2.8.0
+
+# Monitoring
+prometheus-client>=0.19.0
+
+# Optional: async support
+aiohttp>=3.9.0
+
+# Scanner (no extra deps — uses stdlib subprocess + sqlite3)

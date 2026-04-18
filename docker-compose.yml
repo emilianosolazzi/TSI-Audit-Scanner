@@ -1,0 +1,17 @@
+services:
+  audit-service:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - scanner-workspace:/app/scanner_workspace
+      - scan-results:/app/scan_results
+      - scan-db:/app/data
+    restart: unless-stopped
+
+volumes:
+  scanner-workspace:
+  scan-results:
+  scan-db:

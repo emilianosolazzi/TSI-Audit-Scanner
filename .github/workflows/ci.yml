@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify imports
+        run: |
+          python -c "from server import app; print(f'{len(list(app.url_map.iter_rules()))} routes OK')"
+          python -c "from repo_scanner import RepoScanner; print('RepoScanner OK')"
+          python -c "from scanner_scheduler import ScanScheduler; print('ScanScheduler OK')"
+          python -c "from source_analyzer import SourceAnalyzer; print('SourceAnalyzer OK')"
+
+      - name: Health check
+        run: |
+          python -c "
+          import threading, time, urllib.request
+          from server import app
+          t = threading.Thread(target=lambda: app.run(port=9999), daemon=True)
+          t.start()
+          time.sleep(2)
+          resp = urllib.request.urlopen('http://localhost:9999/health')
+          data = resp.read().decode()
+          assert '\"status\": \"ok\"' in data or '\"status\":\"ok\"' in data
+          print('Health check passed')
+          "
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t solidity-audit-service .
+
+      - name: Test Docker container
+        run: |
+          docker run -d --name test-service -p 8080:8080 solidity-audit-service
+          sleep 5
+          curl -f http://localhost:8080/health
+          docker stop test-service

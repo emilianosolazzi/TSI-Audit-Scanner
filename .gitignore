@@ -1,0 +1,60 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Runtime data
+scanner_workspace/
+scan_results/
+scan_history.db
+*.db
+*.log
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TSI artifacts (not part of standalone service)
+TSI_*.md
+TRADERJOE_*.md
+UNISWAP_*.md
+LIDO_*.md
+PENDLE_*.md
+ARCHITECTURE_LOCK.md
+COMPLETE_TSI_VALIDATION.md
+Final_TSI_Findings_*.md
+MULTI_PROTOCOL_TSI_VALIDATION.md
+README_LOCKED.md
+README_TSI_Service.md
+SCANNER_VERIFICATION_REPORT.md
+TECHNICAL_TSI_DOSSIER_*.md
+canonical-proofs/
+docs/
+outputs/
+scripts/
+
+# JS TSI layer (not part of standalone service)
+contradiction-classifier.js
+contradiction-ledger.json
+contradiction-ledger.schema.json
+whitehat_service.js
+whitehat_service.test.js
+integration.test.js
+prediction.js
+generate_validation_report.js
+reproduce_*.js
