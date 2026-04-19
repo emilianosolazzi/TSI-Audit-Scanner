@@ -55,6 +55,9 @@ finding_validator.py
 report_generator.py
 private_validation_lab/
 
+# Bug bounty workspaces (local only, not committed)
+gmx/
+
 # JS TSI layer (not part of standalone service)
 contradiction-classifier.js
 contradiction-ledger.json
