@@ -11,6 +11,7 @@ Stores scan history in SQLite to avoid redundant re-scans.
 """
 
 import os
+import sys
 import json
 import time
 import logging
@@ -18,9 +19,18 @@ import sqlite3
 import hashlib
 import threading
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
+
+# Windows consoles default to cp1252 which can't encode the unicode box-drawing
+# characters used in the summary printer.  Reconfigure to UTF-8 if possible.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 logger = logging.getLogger("ScanScheduler")
 
@@ -119,7 +129,7 @@ class ScanScheduler:
             t.id, t.target_type, t.url, t.chain, t.branch,
             json.dumps(t.scope_paths) if t.scope_paths else None,
             t.priority, t.interval_hours,
-            t.added_at or datetime.utcnow().isoformat() + "Z",
+            t.added_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             t.last_scanned, t.last_findings, 1 if t.enabled else 0
         )
 
@@ -144,7 +154,7 @@ class ScanScheduler:
                 f"{target.target_type}:{target.url}:{target.chain}".encode()
             ).hexdigest()[:16]
 
-        target.added_at = datetime.utcnow().isoformat() + "Z"
+        target.added_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         with self._lock:
             self._conn.execute(
@@ -190,7 +200,7 @@ class ScanScheduler:
     def get_due_targets(self) -> List[ScanTarget]:
         """Get targets that are due for scanning."""
         targets = self.list_targets(enabled_only=True)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         due = []
 
         for t in targets:
@@ -266,7 +276,7 @@ class ScanScheduler:
         scan_id = hashlib.sha256(
             f"{target.id}:{time.time()}".encode()
         ).hexdigest()[:16]
-        started = datetime.utcnow().isoformat() + "Z"
+        started = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         try:
             if target.target_type == "repo":
@@ -298,7 +308,7 @@ class ScanScheduler:
                 self.record_scan(
                     target_id=target.id, scan_id=scan_id,
                     started_at=started,
-                    completed_at=result.completed_at or datetime.utcnow().isoformat() + "Z",
+                    completed_at=result.completed_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     status=result.status.value,
                     findings_count=len(result.findings),
                     critical_count=critical, high_count=high,
@@ -327,7 +337,7 @@ class ScanScheduler:
                 )
                 Path(result_file).write_text(json.dumps(result_dict, indent=2))
 
-                completed = datetime.utcnow().isoformat() + "Z"
+                completed = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                 self.record_scan(
                     target_id=target.id, scan_id=scan_id,
                     started_at=started, completed_at=completed,
@@ -343,7 +353,7 @@ class ScanScheduler:
 
         except Exception as e:
             logger.exception(f"Scan failed for {target.url}")
-            completed = datetime.utcnow().isoformat() + "Z"
+            completed = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             self.record_scan(
                 target_id=target.id, scan_id=scan_id,
                 started_at=started, completed_at=completed,
@@ -421,6 +431,92 @@ class ScanScheduler:
 # CLI entry point
 # ------------------------------------------------------------------
 
+def _print_scan_summary(result: dict) -> None:
+    """Print a structured, human-readable scan summary to stdout."""
+    if result.get("status") == "failed":
+        print(f"SCAN FAILED: {result.get('error', 'unknown error')}")
+        return
+
+    findings = result.get("findings", [])
+    triage = result.get("triage", {})
+    verifs = result.get("exploit_verifications", [])
+
+    sev_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "GAS", "INFO"]
+    sevs: dict = {s: 0 for s in sev_order}
+    for f in findings:
+        sev = f.get("severity", "INFO")
+        sevs[sev] = sevs.get(sev, 0) + 1
+
+    repo = result.get("repo", {})
+    target_label = (
+        repo.get("url")
+        or result.get("contract", {}).get("address")
+        or "?"
+    )
+
+    print("\n" + "=" * 62)
+    print("  TSI-Audit-Scanner — Scan Complete")
+    print("=" * 62)
+    print(f"  Target  : {target_label}")
+    print(f"  Status  : {result.get('status', '?').upper()}")
+    duration = result.get("duration_seconds", 0) or 0
+    print(f"  Duration: {duration:.1f}s")
+    print(f"  Files   : {result.get('files_scanned', 0)}")
+    print()
+
+    print("  FINDINGS SUMMARY")
+    print("  " + "-" * 32)
+    any_finding = False
+    for sev in sev_order:
+        count = sevs.get(sev, 0)
+        if count:
+            any_finding = True
+            bar = "\u2588" * min(count, 38)
+            print(f"  {sev:<8} {count:>4}  {bar}")
+    if not any_finding:
+        print("  No findings.")
+    print()
+
+    if triage:
+        c1 = triage.get("confirm_first", 0)
+        c2 = triage.get("needs_context", 0)
+        c3 = triage.get("likely_noise", 0)
+        print(f"  TRIAGE  confirm_first={c1}  needs_context={c2}  likely_noise={c3}")
+        print()
+
+    confirmed = [v for v in verifs if v.get("exploitable")]
+    if confirmed:
+        print(f"  EXPLOIT VERIFIER \u2014 {len(confirmed)} confirmed exploitable:")
+        for v in confirmed[:5]:
+            fid = v.get("finding_id", "?")
+            atk = v.get("attack_vector", "?")
+            print(f"    \u25cf {fid}  [{atk}]")
+        print()
+
+    top = [f for f in findings if f.get("severity") in ("CRITICAL", "HIGH")][:5]
+    if top:
+        print("  TOP CRITICAL/HIGH FINDINGS")
+        print("  " + "-" * 32)
+        for f in top:
+            sev = f.get("severity", "?")
+            fid = f.get("id", "?")
+            title = f.get("title", "")[:50]
+            line = f.get("line_number", "")
+            fp = f.get("file", "")
+            fp_short = fp.split("/")[-1] if fp else ""
+            loc = f"{fp_short}:{line}" if fp_short else f"line {line}"
+            print(f"  [{sev}] {fid:<20} {title}")
+            print(f"         {loc}")
+        print()
+
+    scan_id = result.get("scan_id", "")
+    results_dir = result.get("results_dir", "scan_results")
+    print("=" * 62)
+    if scan_id:
+        print(f"  Full JSON: {results_dir}/{scan_id}.json")
+    print("=" * 62 + "\n")
+
+
 def main():
     import argparse
 
@@ -459,23 +555,47 @@ def main():
     scheduler = ScanScheduler()
 
     if args.command == "scan":
-        if args.url.startswith("0x"):
-            result = scheduler.scan_now(args.url, chain=args.chain)
+        url = args.url
+        # Auto-detect block-explorer URLs
+        if url.startswith("http") and "scan" in url.lower():
+            try:
+                from config import parse_explorer_url
+                chain, address = parse_explorer_url(url)
+                print(f"Detected {chain} contract: {address}")
+                result = scheduler.scan_now(address, chain=chain)
+            except ValueError as e:
+                print(f"Error parsing explorer URL: {e}")
+                sys.exit(1)
+        elif url.startswith("0x"):
+            result = scheduler.scan_now(url, chain=args.chain)
         else:
             result = scheduler.scan_now(
-                args.url, branch=args.branch, scope_paths=args.scope
+                url, branch=args.branch, scope_paths=args.scope
             )
-        print(json.dumps(result, indent=2))
+        _print_scan_summary(result)
 
     elif args.command == "add":
-        if args.url.startswith("0x"):
+        url = args.url
+        if url.startswith("http") and "scan" in url.lower():
+            try:
+                from config import parse_explorer_url
+                chain, address = parse_explorer_url(url)
+                print(f"Detected {chain} contract: {address}")
+                tid = scheduler.add_address(
+                    address, chain=chain,
+                    interval_hours=args.interval, priority=args.priority
+                )
+            except ValueError as e:
+                print(f"Error parsing explorer URL: {e}")
+                sys.exit(1)
+        elif url.startswith("0x"):
             tid = scheduler.add_address(
-                args.url, chain=args.chain,
+                url, chain=args.chain,
                 interval_hours=args.interval, priority=args.priority
             )
         else:
             tid = scheduler.add_repo(
-                args.url, branch=args.branch,
+                url, branch=args.branch,
                 interval_hours=args.interval, priority=args.priority
             )
         print(f"Added target: {tid}")

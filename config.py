@@ -126,7 +126,7 @@ class Config:
             etherscan_api_key=os.getenv("ETHERSCAN_API_KEY", ""),
             database_url=os.getenv("DATABASE_URL", "sqlite:///audit_service.db"),
             redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-            jwt_secret=os.getenv("JWT_SECRET", "change-me-in-production"),
+            jwt_secret=os.getenv("JWT_SECRET", ""),
             jwt_expiry_hours=int(os.getenv("JWT_EXPIRY_HOURS", "24")),
             cache_ttl_seconds=int(os.getenv("CACHE_TTL", "3600")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
@@ -142,5 +142,85 @@ SUPPORTED_CHAINS = {
     "bsc": {"chain_id": 56, "name": "BNB Smart Chain"},
     "optimism": {"chain_id": 10, "name": "Optimism"},
     "base": {"chain_id": 8453, "name": "Base"},
-    "avalanche": {"chain_id": 43114, "name": "Avalanche C-Chain"}
+    "avalanche": {"chain_id": 43114, "name": "Avalanche C-Chain"},
+    "fantom":    {"chain_id": 250,   "name": "Fantom Opera"},
+    "gnosis":    {"chain_id": 100,   "name": "Gnosis Chain"},
+    "moonbeam":  {"chain_id": 1284,  "name": "Moonbeam"},
 }
+
+# ===================================================
+# BLOCK EXPLORER URL PARSER
+# ===================================================
+
+import re as _re
+from urllib.parse import urlparse as _urlparse
+
+# Map explorer hostnames → chain name (matches SUPPORTED_CHAINS keys)
+EXPLORER_HOST_MAP = {
+    # Ethereum
+    "etherscan.io": "ethereum",
+    "www.etherscan.io": "ethereum",
+    # BSC / BNB Chain
+    "bscscan.com": "bsc",
+    "www.bscscan.com": "bsc",
+    # Polygon
+    "polygonscan.com": "polygon",
+    "www.polygonscan.com": "polygon",
+    # Arbitrum
+    "arbiscan.io": "arbitrum",
+    "www.arbiscan.io": "arbitrum",
+    # Optimism
+    "optimistic.etherscan.io": "optimism",
+    # Base
+    "basescan.org": "base",
+    "www.basescan.org": "base",
+    # Avalanche
+    "snowtrace.io": "avalanche",
+    "www.snowtrace.io": "avalanche",
+    "snowscan.xyz": "avalanche",
+    "www.snowscan.xyz": "avalanche",
+    # Fantom
+    "ftmscan.com": "fantom",
+    "www.ftmscan.com": "fantom",
+    # Gnosis
+    "gnosisscan.io": "gnosis",
+    "www.gnosisscan.io": "gnosis",
+    # Moonbeam
+    "moonscan.io": "moonbeam",
+    "www.moonscan.io": "moonbeam",
+}
+
+_EXPLORER_ADDRESS_RE = _re.compile(r"^/(?:address|token|contract)/+(0x[0-9a-fA-F]{40})(?:[/?#]|$)")
+
+
+def parse_explorer_url(url: str) -> tuple:
+    """Parse a block-explorer URL into (chain, address).
+
+    Accepts URLs like:
+        https://bscscan.com/address/0xB562127efDC97B417B3116efF2C23A29857C0F0B
+        https://etherscan.io/token/0xdAC17F958D2ee523a2206206994597C13D831ec7
+        https://arbiscan.io/address/0x...#code
+
+    Returns:
+        (chain_name, address) on success, e.g. ("bsc", "0xB562...")
+    Raises:
+        ValueError if the URL is not a recognised explorer link.
+    """
+    parsed = _urlparse(url)
+    host = parsed.hostname or ""
+
+    chain = EXPLORER_HOST_MAP.get(host)
+    if chain is None:
+        raise ValueError(
+            f"Unrecognised block-explorer host: {host}. "
+            f"Supported: {', '.join(sorted(set(EXPLORER_HOST_MAP.values())))}"
+        )
+
+    m = _EXPLORER_ADDRESS_RE.match(parsed.path)
+    if not m:
+        raise ValueError(
+            f"Could not extract address from URL path: {parsed.path}. "
+            "Expected /address/0x… or /token/0x…"
+        )
+
+    return chain, m.group(1)

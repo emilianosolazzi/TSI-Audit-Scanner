@@ -90,6 +90,11 @@ class Category(Enum):
     GAS = "Gas Optimization"
     CODE_QUALITY = "Code Quality"
     TSI_CALLBACK = "Temporal State Inconsistency"
+    ASSEMBLY = "Inline Assembly"
+    GOVERNANCE = "Governance"
+    ERC_COMPLIANCE = "ERC Compliance"
+    DATA_VALIDATION = "Data Validation"
+    STORAGE = "Storage Layout"
 
 
 # ===================================================
@@ -134,6 +139,8 @@ PROTECTION_PATTERNS = {
         r"_status\s*=\s*_ENTERED",
         r"locked\s*=\s*true",
         r"require\s*\(\s*!locked",
+        r"reentrancyGuardEntered",
+        r"_reentrancyGuardEntered",
     ],
     # TSI (Temporal State Inconsistency) protections
     "tsi_callback": [
@@ -152,6 +159,8 @@ PROTECTION_PATTERNS = {
         r"initialized\s*=\s*true",
         r"require\s*\([^)]*!initialized",
         r"require\s*\([^)]*msg\.sender\s*==\s*factory\s*&&\s*!initialized",
+        r"_disableInitializers",
+        r"Initializable",
     ],
     # Access control protections  
     "access_control": [
@@ -161,6 +170,9 @@ PROTECTION_PATTERNS = {
         r"require\s*\([^)]*msg\.sender\s*==\s*owner",
         r"require\s*\([^)]*hasRole",
         r"_checkOwner\s*\(",
+        r"onlyGovernance",
+        r"onlyGuardian",
+        r"auth\b",
     ],
     # Safe external call wrappers
     "safe_external_call": [
@@ -172,6 +184,23 @@ PROTECTION_PATTERNS = {
         r"functionCallWithValue",
         r"_callOptionalReturn",
         r"Address\.sendValue",
+        r"ExcessivelySafeCall",
+    ],
+    # Signature protections
+    "signature": [
+        r"nonce",
+        r"DOMAIN_SEPARATOR",
+        r"EIP712",
+        r"_useNonce",
+        r"usedNonces",
+    ],
+    # Governance protections
+    "governance": [
+        r"TimelockController",
+        r"timelock",
+        r"votingDelay",
+        r"getPastVotes",
+        r"ERC20Votes",
     ],
 }
 
@@ -475,18 +504,453 @@ KNOWN_VULNERABILITIES = {
         "exclude_if": ["Initializable", "@openzeppelin", "initializer", "initialized", "interface ", "Pair", "Pool", "Factory"],
         "require_absent": ["import.*Initializable"]
     },
+    # ===========================================
+    # SIGNATURE & CRYPTOGRAPHY VULNERABILITIES
+    # ===========================================
+    "SIG-001": {
+        "name": "Unchecked ecrecover Return",
+        "severity": Severity.CRITICAL,
+        "category": Category.SIGNATURE,
+        "pattern": r"ecrecover\s*\(",
+        "description": "ecrecover returns address(0) on invalid signature instead of reverting. Missing zero-address check allows signature forgery.",
+        "recommendation": "Check ecrecover result != address(0), or use OpenZeppelin ECDSA.recover() which reverts on invalid signatures",
+        "exclude_if": ["ECDSA.recover", "require(signer != address(0)", "require(recovered != address(0)", "SignatureChecker"]
+    },
+    "SIG-002": {
+        "name": "Missing Signature Replay Protection",
+        "severity": Severity.HIGH,
+        "category": Category.SIGNATURE,
+        "pattern": r"ecrecover\s*\([^)]*\)|ECDSA\.recover\s*\(",
+        "description": "Signature used without nonce or domain separator. Signatures can be replayed across chains or transactions.",
+        "recommendation": "Implement EIP-712 typed data signing with nonce tracking and DOMAIN_SEPARATOR",
+        "exclude_if": ["nonce", "DOMAIN_SEPARATOR", "EIP712", "_useNonce", "usedNonces", "invalidateNonce"]
+    },
+    "SIG-003": {
+        "name": "Signature Malleability",
+        "severity": Severity.MEDIUM,
+        "category": Category.SIGNATURE,
+        "pattern": r"ecrecover\s*\([^)]*\)",
+        "description": "Raw ecrecover is vulnerable to signature malleability (s-value manipulation). An attacker can produce a second valid signature.",
+        "recommendation": "Use OpenZeppelin ECDSA.recover() which enforces lower-s values per EIP-2",
+        "exclude_if": ["ECDSA.recover", "ECDSA.tryRecover", "s <= 0x7FFFFFFF", "SignatureChecker"]
+    },
+    "SIG-004": {
+        "name": "Missing EIP-712 Domain Separator",
+        "severity": Severity.MEDIUM,
+        "category": Category.SIGNATURE,
+        "pattern": r"permit\s*\(|executeMetaTransaction\s*\(|delegateBySig\s*\(",
+        "description": "Meta-transaction or permit function without EIP-712 domain separator enables cross-chain replay",
+        "recommendation": "Implement EIP-712 with DOMAIN_SEPARATOR including chainId and verifyingContract",
+        "exclude_if": ["DOMAIN_SEPARATOR", "EIP712", "_domainSeparatorV4", "eip712Domain"]
+    },
+    # ===========================================
+    # TOKEN SECURITY VULNERABILITIES
+    # ===========================================
+    "TOKEN-001": {
+        "name": "ERC-20 Approval Race Condition",
+        "severity": Severity.MEDIUM,
+        "category": Category.TOKEN,
+        "pattern": r"function\s+approve\s*\(\s*address[^,]*,\s*uint256",
+        "description": "Standard approve() is vulnerable to front-running race condition when changing allowance from non-zero to non-zero",
+        "recommendation": "Implement increaseAllowance/decreaseAllowance pattern or require current allowance is 0",
+        "exclude_if": ["increaseAllowance", "decreaseAllowance", "safeIncreaseAllowance", "interface "]
+    },
+    "TOKEN-002": {
+        "name": "ERC-4626 Inflation Attack",
+        "severity": Severity.CRITICAL,
+        "category": Category.TOKEN,
+        "pattern": r"function\s+deposit\s*\([^)]*\)[^}]*totalAssets\s*\(\)|ERC4626|ERC-4626",
+        "description": "First depositor can inflate share price by donating tokens, causing subsequent depositors to receive 0 shares",
+        "recommendation": "Implement virtual shares/assets offset (OpenZeppelin 4.9+ does this), or require minimum deposit, or use dead shares",
+        "exclude_if": ["_decimalsOffset", "virtual shares", "INITIAL_SHARES"]
+    },
+    "TOKEN-003": {
+        "name": "Fee-on-Transfer Token Incompatibility",
+        "severity": Severity.MEDIUM,
+        "category": Category.TOKEN,
+        "pattern": r"transferFrom\s*\([^)]*\)\s*;[^}]*(?:amount|_amount|value)",
+        "description": "Contract assumes transfer amount equals received amount. Fee-on-transfer tokens will cause accounting errors.",
+        "recommendation": "Measure actual received amount: balanceAfter - balanceBefore",
+        "exclude_if": ["balanceOf(address(this))", "balanceBefore", "balanceAfter", "received ="]
+    },
+    "TOKEN-004": {
+        "name": "Rebasing Token Incompatibility",
+        "severity": Severity.MEDIUM,
+        "category": Category.TOKEN,
+        "pattern": r"balanceOf\s*\([^)]*\)\s*[;,].*(?:mapping|stored|cached)",
+        "description": "Caching balanceOf for rebasing tokens will produce stale values after rebase events",
+        "recommendation": "Use shares-based accounting instead of absolute balances for rebasing token support"
+    },
+    "TOKEN-005": {
+        "name": "ERC-777 Reentrancy via Hooks",
+        "severity": Severity.HIGH,
+        "category": Category.REENTRANCY,
+        "pattern": r"IERC777|ERC777|tokensReceived|tokensToSend",
+        "description": "ERC-777 tokens trigger hooks on send/receive that can be used for reentrancy attacks",
+        "recommendation": "Use ReentrancyGuard on all functions accepting ERC-777 tokens, or check-effects-interactions",
+        "protection_check": "reentrancy"
+    },
+    "TOKEN-006": {
+        "name": "Permit Frontrunning",
+        "severity": Severity.LOW,
+        "category": Category.TOKEN,
+        "pattern": r"permit\s*\([^)]*\)\s*;[^}]*transferFrom",
+        "description": "permit() + transferFrom() pattern can be grief-attacked: attacker front-runs permit call, causing the bundled TX to revert",
+        "recommendation": "Wrap permit in try-catch or check allowance before calling permit"
+    },
+    "TOKEN-007": {
+        "name": "Unsafe Downcast",
+        "severity": Severity.MEDIUM,
+        "category": Category.ARITHMETIC,
+        "pattern": r"(?:uint(?:8|16|32|64|96|128|160)|int(?:8|16|32|64|128))\s*\(\s*\w+\s*\)",
+        "description": "Downcasting from larger to smaller integer type silently truncates in Solidity 0.8+. Use SafeCast.",
+        "recommendation": "Use OpenZeppelin SafeCast library for safe type narrowing",
+        "exclude_if": ["SafeCast", "safeCast", "toUint128", "toUint96", "toInt128"]
+    },
+    # ===========================================
+    # DENIAL OF SERVICE VULNERABILITIES
+    # ===========================================
+    "DOS-001": {
+        "name": "Unbounded Loop / Array Length DoS",
+        "severity": Severity.HIGH,
+        "category": Category.DOS,
+        "pattern": r"for\s*\(\s*(?:uint\d*\s+)?\w+\s*=\s*0\s*;\s*\w+\s*<\s*\w+\.length\s*;",
+        "description": "Loop iterating over unbounded array length can exceed block gas limit, permanently bricking the function",
+        "recommendation": "Set maximum array length, use pagination, or use EnumerableSet with bounded iteration"
+    },
+    "DOS-002": {
+        "name": "External Call in Loop",
+        "severity": Severity.HIGH,
+        "category": Category.DOS,
+        "pattern": r"for\s*\([^)]+\)\s*\{[^}]*(?:\.call|\.transfer|\.send|\.safeTransfer)\s*\(",
+        "description": "External calls inside loops can fail for one recipient and revert the entire transaction (pull-over-push)",
+        "recommendation": "Use pull payment pattern: let recipients withdraw instead of pushing payments in a loop"
+    },
+    "DOS-003": {
+        "name": "Block Gas Limit via Array Push",
+        "severity": Severity.MEDIUM,
+        "category": Category.DOS,
+        "pattern": r"\.push\s*\([^)]*\)\s*;(?![^}]*\.pop\b)",
+        "description": "Array grows without bound via push() with no corresponding cleanup. May exceed gas limit.",
+        "recommendation": "Implement maximum array size, cleanup mechanism, or use mapping with counter"
+    },
+    "DOS-004": {
+        "name": "Return Bomb Attack",
+        "severity": Severity.MEDIUM,
+        "category": Category.DOS,
+        "pattern": r"\.call\{[^}]*\}\([^)]*\)\s*;(?!.*assembly)",
+        "description": "Low-level call copies return data to memory. Malicious callee can return huge data to consume caller's gas.",
+        "recommendation": "Use assembly to limit returndata size: assembly { pop(call(...)) }",
+        "exclude_if": ["assembly", "returndatasize", "ExcessivelySafeCall"]
+    },
+    # ===========================================
+    # DATA VALIDATION VULNERABILITIES
+    # ===========================================
+    "VALIDATE-001": {
+        "name": "Missing Zero-Address Check",
+        "severity": Severity.LOW,
+        "category": Category.DATA_VALIDATION,
+        "pattern": r"function\s+(?:set|update|change)\w*\s*\([^)]*address\s+\w+[^)]*\)\s*(?:external|public)",
+        "description": "Admin function accepting address parameter without zero-address validation",
+        "recommendation": "Add require(_addr != address(0), 'zero address') for critical address parameters",
+        "exclude_if": ["require(", "address(0)", "!= address(0)", "_checkNonZero", "interface "]
+    },
+    "VALIDATE-002": {
+        "name": "msg.value in Loop",
+        "severity": Severity.CRITICAL,
+        "category": Category.DATA_VALIDATION,
+        "pattern": r"for\s*\([^)]+\)\s*\{[^}]*msg\.value",
+        "description": "msg.value used inside a loop allows the same ETH to be counted multiple times",
+        "recommendation": "Cache msg.value before loop and track total spent amount"
+    },
+    "VALIDATE-003": {
+        "name": "Missing Input Validation on Constructor",
+        "severity": Severity.LOW,
+        "category": Category.DATA_VALIDATION,
+        "pattern": r"constructor\s*\([^)]*address\s+\w+[^)]*\)\s*\{(?:(?!require|assert|if\s*\().)*\}",
+        "description": "Constructor accepts address parameters without validation. Bad deployment is irreversible.",
+        "recommendation": "Validate constructor parameters, especially addresses != address(0)"
+    },
+    # ===========================================
+    # CODE QUALITY & BEST PRACTICES
+    # ===========================================
+    "QUALITY-001": {
+        "name": "Floating Pragma",
+        "severity": Severity.LOW,
+        "category": Category.CODE_QUALITY,
+        "pattern": r"pragma\s+solidity\s*[\^~]",
+        "description": "Floating pragma allows compilation with different compiler versions, introducing inconsistent behavior risk",
+        "recommendation": "Lock pragma to specific version: pragma solidity 0.8.24;",
+        "exclude_if": ["interface ", "library "]
+    },
+    "QUALITY-002": {
+        "name": "Assert Instead of Require",
+        "severity": Severity.LOW,
+        "category": Category.CODE_QUALITY,
+        "pattern": r"assert\s*\([^)]+\)\s*;",
+        "description": "assert() consumes all remaining gas on failure. Use require() for input validation.",
+        "recommendation": "Replace assert() with require() for user-facing checks. Reserve assert() for invariant checks only.",
+        "exclude_if": ["invariant", "// assert"]
+    },
+    "QUALITY-003": {
+        "name": "Empty Catch Block",
+        "severity": Severity.MEDIUM,
+        "category": Category.CODE_QUALITY,
+        "pattern": r"catch\s*(?:\([^)]*\))?\s*\{\s*\}",
+        "description": "Empty catch block silently swallows errors, hiding potential failures",
+        "recommendation": "Log or handle the error, or emit an event in the catch block"
+    },
+    "QUALITY-004": {
+        "name": "Missing Event Emission on State Change",
+        "severity": Severity.LOW,
+        "category": Category.CODE_QUALITY,
+        "pattern": r"function\s+(?:set|update|change)\w*\s*\([^)]*\)\s*(?:external|public)[^}]*\w+\s*=\s*[^;]+;(?:(?!emit\s).)*\}",
+        "description": "State-changing function does not emit an event. Off-chain monitoring cannot track changes.",
+        "recommendation": "Emit events for all state changes, especially admin functions"
+    },
+    "QUALITY-005": {
+        "name": "Shadowed State Variable",
+        "severity": Severity.MEDIUM,
+        "category": Category.CODE_QUALITY,
+        "pattern": r"(?:uint|address|bool|bytes|string|int)\d*\s+(?:public\s+)?(\w+)\s*[;=].*function\s+\w+[^}]*(?:uint|address|bool|bytes|string|int)\d*\s+\1\b",
+        "description": "Local variable shadows a state variable, leading to unexpected behavior",
+        "recommendation": "Rename local variable to avoid shadowing. Use different naming convention (e.g., underscore prefix)"
+    },
+    # ===========================================
+    # GOVERNANCE VULNERABILITIES
+    # ===========================================
+    "GOV-001": {
+        "name": "Flash Loan Governance Attack",
+        "severity": Severity.HIGH,
+        "category": Category.GOVERNANCE,
+        "pattern": r"function\s+(?:propose|vote|castVote|delegate)\s*\([^)]*\)[^}]*(?:balanceOf|votingPower|getPriorVotes)",
+        "description": "Governance vote weight based on current token balance is vulnerable to flash loan manipulation",
+        "recommendation": "Use snapshot-based voting (ERC20Votes) with voting delay. Check votes at proposal creation block.",
+        "exclude_if": ["getPastVotes", "getPriorVotes", "snapshot", "Votes", "ERC20Votes"]
+    },
+    "GOV-002": {
+        "name": "Missing Timelock on Critical Operations",
+        "severity": Severity.MEDIUM,
+        "category": Category.GOVERNANCE,
+        "pattern": r"function\s+(?:upgrade|migrate|setImplementation|emergencyWithdraw)\s*\([^)]*\)\s*(?:external|public)",
+        "description": "Critical operation executes immediately without timelock. Users have no time to exit.",
+        "recommendation": "Add TimelockController for critical operations to give users time to react",
+        "exclude_if": ["timelock", "TimelockController", "delay", "queuedTransactions", "interface "]
+    },
+    # ===========================================
+    # ASSEMBLY / YUL VULNERABILITIES
+    # ===========================================
+    "ASM-001": {
+        "name": "Inline Assembly Memory Safety",
+        "severity": Severity.HIGH,
+        "category": Category.ASSEMBLY,
+        "pattern": r"assembly\s*\{[^}]*mstore\s*\([^)]*\)",
+        "description": "Inline assembly writes to memory without bounds checking. Can corrupt Solidity's free memory pointer.",
+        "recommendation": "Use memory-safe assembly annotation or ensure writes stay within allocated memory. Load free memory pointer first.",
+        "exclude_if": ["memory-safe", "/// @solidity memory-safe"]
+    },
+    "ASM-002": {
+        "name": "Delegatecall to Untrusted Target",
+        "severity": Severity.CRITICAL,
+        "category": Category.EXTERNAL_CALL,
+        "pattern": r"delegatecall\s*\([^)]*\w+[^)]*\)",
+        "description": "Delegatecall to a variable address allows arbitrary code execution in the context of the calling contract",
+        "recommendation": "Only delegatecall to trusted, immutable implementation addresses. Never to user-supplied addresses.",
+        "exclude_if": ["IMPLEMENTATION_SLOT", "eip1967", "library Address", "_implementation()", "Proxy"]
+    },
+    "ASM-003": {
+        "name": "Unchecked Returndatasize",
+        "severity": Severity.MEDIUM,
+        "category": Category.ASSEMBLY,
+        "pattern": r"assembly\s*\{[^}]*call\s*\([^)]*\)[^}]*(?!returndatasize)",
+        "description": "Low-level call in assembly without checking returndatasize may process garbage data",
+        "recommendation": "Always check returndatasize() after low-level calls in assembly"
+    },
+    # ===========================================
+    # STORAGE LAYOUT VULNERABILITIES
+    # ===========================================
+    "STORAGE-001": {
+        "name": "Missing Storage Gap in Upgradeable Contract",
+        "severity": Severity.HIGH,
+        "category": Category.STORAGE,
+        "pattern": r"contract\s+\w+.*?(?:Upgradeable|Initializable)[^}]*\}",
+        "description": "Upgradeable base contract without __gap variable. Adding state variables in future versions will corrupt storage layout.",
+        "recommendation": "Add uint256[50] private __gap; at the end of the contract to reserve storage slots",
+        "exclude_if": ["__gap", "uint256[", "StorageSlot", "interface "]
+    },
+    "STORAGE-002": {
+        "name": "Unprotected Implementation Contract",
+        "severity": Severity.HIGH,
+        "category": Category.INITIALIZATION,
+        "pattern": r"contract\s+\w+\s+is\s+[^{]*Initializable[^}]*constructor\s*\(\s*\)\s*\{(?:(?!_disableInitializers).)*\}",
+        "description": "Implementation contract constructor does not call _disableInitializers(). Attacker can initialize the implementation directly.",
+        "recommendation": "Add _disableInitializers() in constructor of all implementation contracts",
+        "exclude_if": ["_disableInitializers", "interface "]
+    },
+    # ===========================================
+    # CROSS-FUNCTION & READ-ONLY REENTRANCY
+    # ===========================================
+    "REENT-001": {
+        "name": "Read-Only Reentrancy",
+        "severity": Severity.HIGH,
+        "category": Category.REENTRANCY,
+        "pattern": r"function\s+\w+\s*\([^)]*\)\s*(?:external|public)\s+view[^}]*(?:totalSupply|balanceOf|getReserves|slot0|liquidity)",
+        "description": "View function reads state that may be inconsistent during a callback from another contract's non-view function",
+        "recommendation": "Add nonReentrant modifier to functions that read pricing/reserve state, or use reentrancy lock checks in view functions",
+        "protection_check": "reentrancy"
+    },
+    "REENT-002": {
+        "name": "Cross-Function Reentrancy",
+        "severity": Severity.HIGH,
+        "category": Category.REENTRANCY,
+        "pattern": r"\.call\{value:[^}]*\}[^;]*;[^}]*\}[^}]*function\s+\w+\s*\([^)]*\)\s*(?:external|public)(?!.*view)",
+        "description": "External call in one function may allow reentry into a different public function that reads stale state",
+        "recommendation": "Apply nonReentrant modifier to ALL public/external functions that read or write shared state",
+        "protection_check": "reentrancy"
+    },
+    # ===========================================
+    # ADVANCED DEFI PATTERNS
+    # ===========================================
+    "DEFI-005": {
+        "name": "Missing Deadline in Swap",
+        "severity": Severity.MEDIUM,
+        "category": Category.MEV,
+        "pattern": r"function\s+swap\w*\s*\([^)]*\)\s*(?:external|public)(?![^}]*deadline)",
+        "description": "Swap function lacks deadline parameter. Pending transactions can be held and executed at unfavorable prices.",
+        "recommendation": "Add deadline parameter and require(block.timestamp <= deadline)",
+        "exclude_if": ["deadline", "expiry", "validUntil", "Pair", "Pool", "interface "]
+    },
+    "DEFI-006": {
+        "name": "Missing Circuit Breaker",
+        "severity": Severity.MEDIUM,
+        "category": Category.LOGIC,
+        "pattern": r"function\s+(?:withdraw|borrow|liquidat)\w*\s*\([^)]*\)\s*(?:external|public)",
+        "description": "High-value operation without circuit breaker. No ability to pause in case of emergency.",
+        "recommendation": "Implement Pausable pattern for critical financial operations",
+        "exclude_if": ["whenNotPaused", "Pausable", "paused()", "interface ", "require(!paused"]
+    },
+    "DEFI-007": {
+        "name": "Precision Loss in Token Conversion",
+        "severity": Severity.MEDIUM,
+        "category": Category.ARITHMETIC,
+        "pattern": r"(?:\*\s*10\s*\*\*|\/\s*10\s*\*\*)\s*(?:\w+\.decimals|decimals)",
+        "description": "Token decimal conversion may lose precision when dividing before multiplying or using inconsistent decimal handling",
+        "recommendation": "Always multiply before dividing. Use a common precision base for cross-token calculations."
+    },
+    "DEFI-008": {
+        "name": "Force-Feeding ETH via Selfdestruct",
+        "severity": Severity.MEDIUM,
+        "category": Category.LOGIC,
+        "pattern": r"address\(this\)\.balance\s*(?:==|>=|<=|>|<)",
+        "description": "Contract logic depends on exact ETH balance. Attacker can force-feed ETH via selfdestruct to break invariants.",
+        "recommendation": "Track balances via internal accounting instead of address(this).balance",
+        "semantic_verifier": "strict_equality",
+    },
+    # ===========================================
+    # CREATE2 & ADVANCED ATTACK VECTORS
+    # ===========================================
+    "ADVANCED-001": {
+        "name": "CREATE2 Address Collision Risk",
+        "severity": Severity.MEDIUM,
+        "category": Category.LOGIC,
+        "pattern": r"create2\s*\(|CREATE2|new\s+\w+\{salt:",
+        "description": "CREATE2 enables deterministic addresses. If contract is destroyed and redeployed with different code, existing approvals/permissions persist.",
+        "recommendation": "Do not approve or trust CREATE2 addresses that can be destroyed and redeployed"
+    },
+    "ADVANCED-002": {
+        "name": "Unprotected Receive/Fallback",
+        "severity": Severity.LOW,
+        "category": Category.DATA_VALIDATION,
+        "pattern": r"(?:receive|fallback)\s*\(\s*\)\s*external\s+payable\s*\{\s*\}",
+        "description": "Empty receive/fallback accepts ETH from any source without validation or event emission",
+        "recommendation": "Add validation, events, or restrict to expected senders in receive/fallback"
+    },
+    # ===========================================
+    # TSI — Stale Parameter & Generic Callback Patterns
+    # Based on WhiteHat Service TSI research (SSV, Stargate, Uniswap)
+    # ===========================================
+    "TSI-007": {
+        "name": "Stale Struct Parameter Injection",
+        "severity": Severity.CRITICAL,
+        "category": Category.TSI_CALLBACK,
+        "pattern": r"function\s+(?:withdraw|liquidate|exit|rebalance|settle)\w*\s*\([^)]*(?:Cluster|Position|State|Info|Data)\s+(?:memory|calldata)\s+\w+[^)]*\)",
+        "description": "Function accepts user-supplied struct parameter that shadows on-chain storage. Attacker passes stale snapshot to bypass validation (proven in SSV Network TSI-SSV-001: $26M+ at risk).",
+        "recommendation": "NEVER trust user-supplied struct for validation. Always re-read from storage. Compare struct hash with stored hash before use.",
+        "protection_check": "tsi_callback",
+        "reference": "TSI-SSV-001 — stale Cluster parameter bypasses balance validation"
+    },
+    "TSI-008": {
+        "name": "Generic Callback State Read",
+        "severity": Severity.HIGH,
+        "category": Category.TSI_CALLBACK,
+        "pattern": r"function\s+(?:uniswapV[23]\w*Callback|pancakeV3\w*Callback|algebraSwapCallback|onFlashLoan|receiveFlashLoan|hook_(?:before|after)Swap|onERC721Received|onERC1155\w+)\s*\([^)]*\)[^{]*\{[^}]*(?:balanceOf|totalSupply|getReserves|slot0|liquidity|totalAssets|convertToShares|exchangeRate)",
+        "description": "Reading pool/token state inside a callback function body. During callback execution, on-chain state may be mid-mutation and inconsistent.",
+        "recommendation": "Snapshot all required state BEFORE initiating the operation that triggers the callback. Pass snapshots as parameters or use transient storage.",
+        "protection_check": "tsi_callback"
+    },
+    "DEFI-009": {
+        "name": "LP Token Valuation During Callback",
+        "severity": Severity.CRITICAL,
+        "category": Category.TSI_CALLBACK,
+        "pattern": r"(?:uniswapV3\w*Callback|sgReceive|lzReceive|onFlashLoan|receiveFlashLoan)[^}]*(?:totalAssets|convertToShares|convertToAssets|pricePerShare|getUnderlyingBalances|getLPValue|sharesToUnderlying)",
+        "description": "LP token or vault share valuation computed during callback. Value can be temporarily inflated by the in-flight operation, enabling over-borrowing or over-minting.",
+        "recommendation": "CRITICAL: Never compute collateral/LP value during callbacks. Use pre-operation snapshots. See TSI-STARGATE-001 for $26M extraction proof.",
+        "protection_check": "tsi_callback",
+        "reference": "TSI-STARGATE-001 — LP value inflated during sgReceive"
+    },
+    "DEFI-010": {
+        "name": "Bridge Callback Without Snapshot Validation",
+        "severity": Severity.HIGH,
+        "category": Category.TSI_CALLBACK,
+        "pattern": r"function\s+(?:sgReceive|lzReceive|_lzReceive|ccipReceive|onOFTReceived|anySwapIn|bridgeCallback)\s*\([^)]*\)[^{]*\{(?:(?!snapshot|preState|beforeState|cachedState).)*\}",
+        "description": "Bridge/cross-chain callback without referencing pre-operation state snapshot. State may have changed between send and receive.",
+        "recommendation": "Store state snapshot before cross-chain send. Validate received callback against stored snapshot, not live state.",
+        "protection_check": "tsi_callback"
+    },
+    # ===========================================
+    # ORACLE MANIPULATION PATTERNS
+    # (ORACLE-MANIP-001/002/003 are handled by _analyze_oracle_patterns()
+    #  which applies high-stakes consumer context checks.)
+    # ===========================================
+    "ORACLE-MANIP-004": {
+        "name": "Single-block TWAP Window",
+        "severity": Severity.MEDIUM,
+        "category": Category.ORACLE,
+        "pattern": r"observe\(\[0,\s*1\]\)|secondsAgos\s*=\s*\[0,\s*1\]",
+        "description": "TWAP window of 1 second is effectively spot price \u2014 still manipulable",
+        "recommendation": "Use minimum 10-30 minute TWAP window for manipulation resistance",
+    },
+    "ORACLE-MANIP-005": {
+        "name": "Price Used Same Block as Update",
+        "severity": Severity.HIGH,
+        "category": Category.ORACLE,
+        "pattern": r"update\(.*\).*getPrice|getPrice.*update\(",
+        "description": "Oracle updated and read in same transaction \u2014 flash loan manipulable",
+        "recommendation": "Enforce minimum delay between oracle update and consumption",
+        "exclude_if": ["require.*block.number", "lastUpdate"],
+    },
 }
 
 # DeFi protocol signatures for detection
 DEFI_PROTOCOLS = {
     "uniswap_v2": ["getReserves", "swap", "mint", "burn", "sync"],
     "uniswap_v3": ["swap", "mint", "burn", "flash", "positions"],
+    "uniswap_v4": ["swap", "modifyLiquidity", "donate", "settle", "take"],
     "aave": ["flashLoan", "deposit", "withdraw", "borrow", "repay"],
+    "aave_v3": ["supply", "flashLoan", "liquidationCall", "setUserUseReserveAsCollateral"],
     "compound": ["mint", "redeem", "borrow", "repayBorrow", "liquidateBorrow"],
+    "compound_v3": ["supply", "withdraw", "absorb", "buyCollateral"],
+    "curve": ["exchange", "add_liquidity", "remove_liquidity", "get_dy"],
+    "balancer_v2": ["flashLoan", "swap", "joinPool", "exitPool"],
     "chainlink": ["latestAnswer", "latestRoundData", "getRoundData"],
     "erc20": ["transfer", "transferFrom", "approve", "balanceOf", "allowance"],
     "erc721": ["safeTransferFrom", "ownerOf", "tokenURI", "setApprovalForAll"],
     "erc1155": ["safeBatchTransferFrom", "balanceOfBatch", "uri"],
+    "erc4626": ["deposit", "withdraw", "redeem", "convertToShares", "convertToAssets"],
+    "stargate": ["swap", "sgReceive", "sendTokens", "bridge"],
+    "layerzero": ["lzReceive", "send", "estimateFees", "_nonblockingLzReceive"],
+    "maker": ["join", "exit", "frob", "grab", "draw"],
+    "openzeppelin_governor": ["propose", "castVote", "execute", "queue"],
 }
 
 
@@ -725,6 +1189,19 @@ class ChainClient:
         "moonbeam": {"chain_id": 1284, "symbol": "GLMR"},
     }
     
+    PUBLIC_RPCS = {
+        "ethereum": "https://eth.llamarpc.com",
+        "arbitrum": "https://arb1.arbitrum.io/rpc",
+        "polygon": "https://polygon-rpc.com",
+        "bsc": "https://bsc-dataseed.binance.org",
+        "optimism": "https://mainnet.optimism.io",
+        "base": "https://mainnet.base.org",
+        "avalanche": "https://api.avax.network/ext/bc/C/rpc",
+        "fantom": "https://rpc.ftm.tools",
+        "gnosis": "https://rpc.gnosischain.com",
+        "moonbeam": "https://rpc.api.moonbeam.network",
+    }
+    
     def __init__(self, api_key: str, chain: str = "ethereum"):
         self.api_key = api_key
         self.chain = chain.lower()
@@ -732,11 +1209,38 @@ class ChainClient:
             raise ValueError(f"Unsupported chain: {chain}")
         self.chain_id = self.CHAINS[self.chain]["chain_id"]
         self.base_url = "https://api.etherscan.io/v2/api"
+        self.rpc_url = self.PUBLIC_RPCS.get(self.chain)
         self.session = requests.Session()
         self.rate_limit_delay = 0.35  # ~3 calls/sec to be safe
         self.last_request = 0
     
+    CHAIN_API_URLS = {
+        "ethereum": "https://api.etherscan.io/api",
+        "arbitrum": "https://api.arbiscan.io/api",
+        "polygon": "https://api.polygonscan.com/api",
+        "bsc": "https://api.bscscan.com/api",
+        "optimism": "https://api-optimistic.etherscan.io/api",
+        "base": "https://api.basescan.org/api",
+        "avalanche": "https://api.snowtrace.io/api",
+        "fantom": "https://api.ftmscan.com/api",
+        "gnosis": "https://api.gnosisscan.io/api",
+        "moonbeam": "https://api-moonbeam.moonscan.io/api",
+    }
+
     def _request(self, module: str, action: str, retries: int = 3, **params) -> Dict:
+        """Make rate-limited API request with retries. Falls back to chain-specific API."""
+        result = self._do_request(self.base_url, module, action, retries,
+                                  extra={"chainid": self.chain_id}, **params)
+        # If v2 API fails (unsupported chain on free tier), try chain-specific endpoint
+        if result.get("status") == "0" and self.chain in self.CHAIN_API_URLS:
+            err_msg = str(result.get("result", "")).lower()
+            if "invalid api" in err_msg or "not supported" in err_msg or "upgrade" in err_msg:
+                logger.debug(f"V2 API failed for {self.chain}, falling back to chain-specific endpoint")
+                return self._do_request(self.CHAIN_API_URLS[self.chain], module, action, retries, **params)
+        return result
+
+    def _do_request(self, url: str, module: str, action: str, retries: int = 3,
+                    extra: Dict = None, **params) -> Dict:
         """Make rate-limited API request with retries."""
         for attempt in range(retries):
             elapsed = time.time() - self.last_request
@@ -744,15 +1248,17 @@ class ChainClient:
                 time.sleep(self.rate_limit_delay - elapsed)
             self.last_request = time.time()
             
-            params.update({
-                "chainid": self.chain_id,
+            req_params = dict(params)
+            req_params.update({
                 "module": module,
                 "action": action,
                 "apikey": self.api_key
             })
+            if extra:
+                req_params.update(extra)
             
             try:
-                resp = self.session.get(self.base_url, params=params, timeout=30)
+                resp = self.session.get(url, params=req_params, timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
                 
@@ -817,18 +1323,38 @@ class ChainClient:
         return []
     
     def call_function(self, address: str, selector: str) -> Optional[str]:
-        """Call view function via eth_call."""
+        """Call view function via eth_call, falling back to direct RPC."""
         data = self._request("proxy", "eth_call", to=address, data=selector, tag="latest")
         if "result" in data and not data.get("error"):
-            return data["result"]
+            val = data["result"]
+            if isinstance(val, str) and val.startswith("0x") and all(c in '0123456789abcdefABCDEF' for c in val[2:]):
+                return val
+        return self._rpc_call("eth_call", [{"to": address, "data": selector}, "latest"])
+
+    def _rpc_call(self, method: str, params: list) -> Optional[str]:
+        """Direct JSON-RPC call via public RPC endpoint (fallback for non-Ethereum chains)."""
+        if not self.rpc_url:
+            return None
+        try:
+            resp = self.session.post(self.rpc_url, json={
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+            }, timeout=10)
+            data = resp.json()
+            val = data.get("result")
+            if isinstance(val, str) and val.startswith("0x") and all(c in '0123456789abcdefABCDEF' for c in val[2:]):
+                return val
+        except Exception as e:
+            logger.debug(f"RPC fallback failed: {e}")
         return None
 
     def get_storage_at(self, address: str, slot: str) -> Optional[str]:
-        """Read storage slot value."""
+        """Read storage slot value via Etherscan, falling back to direct RPC."""
         data = self._request("proxy", "eth_getStorageAt", address=address, position=slot, tag="latest")
         if "result" in data and not data.get("error"):
-            return data["result"]
-        return None
+            val = data["result"]
+            if isinstance(val, str) and val.startswith("0x") and all(c in '0123456789abcdefABCDEF' for c in val[2:]):
+                return val
+        return self._rpc_call("eth_getStorageAt", [address, slot, "latest"])
 
     def check_proxy_initialized(self, address: str) -> dict:
         """Check if proxy is initialized by reading beacon/implementation slots."""
@@ -1080,20 +1606,30 @@ class StateContradictionAnalyzer:
                     line_number=line_num
                 ))
     
+    def _extract_functions(self) -> list:
+        """Extract function name and body handling nested braces."""
+        results = []
+        for m in re.finditer(r"function\s+(\w+)[^{]*\{", self.source):
+            func_name = m.group(1)
+            start = m.end()
+            depth = 1
+            i = start
+            while i < len(self.source) and depth > 0:
+                if self.source[i] == '{':
+                    depth += 1
+                elif self.source[i] == '}':
+                    depth -= 1
+                i += 1
+            results.append((func_name, self.source[start:i-1], m.start()))
+        return results
+
     def _check_reentrancy_contradictions(self):
         """Check for reentrancy state contradictions using CEI pattern."""
         # Checks-Effects-Interactions pattern violation
         # Expected: state changes before external calls
         # Observed: external calls before state changes
         
-        cei_pattern = re.compile(
-            r"function\s+(\w+).*?\{(.*?)\}",
-            re.DOTALL
-        )
-        
-        for match in cei_pattern.finditer(self.source):
-            func_name = match.group(1)
-            func_body = match.group(2)
+        for func_name, func_body, func_start in self._extract_functions():
             
             # Find external calls
             external_call_pos = func_body.find(".call{")
@@ -1107,10 +1643,10 @@ class StateContradictionAnalyzer:
                 after_call = func_body[external_call_pos:]
                 
                 # Look for state modifications
-                state_change = re.search(r"(\w+)\s*[+\-*/]=|(\w+)\s*=\s*(?!\s*require)", after_call)
+                state_change = re.search(r"(\w+(?:\[[^\]]*\])?)\s*[+\-*/]=|(\w+(?:\[[^\]]*\])?)\s*=\s*(?!\s*require)", after_call)
                 
                 if state_change:
-                    line_num = self.source[:match.start()].count("\n") + 1
+                    line_num = self.source[:func_start].count("\n") + 1
                     
                     self.contradictions.append(StateContradiction(
                         entity=f"function_{func_name}_state",
@@ -1228,8 +1764,17 @@ class SourceAnalyzer:
         self._analyze_arithmetic()
         self._analyze_gas_patterns()
         self._analyze_defi_patterns()
+        self._analyze_oracle_patterns()
         self._analyze_upgrade_patterns()
-        
+        self._analyze_assembly()
+        self._analyze_erc_compliance()
+        self._analyze_signature_patterns()
+
+        # Specialized analyzers added from academic-paper tests (practical versions)
+        self._analyze_cross_function_reentrancy()
+        self._analyze_flash_loan_arbitrage()
+        self._analyze_mev_sandwich()
+
         return self.findings
     
     def _check_known_vulnerabilities(self):
@@ -1642,19 +2187,87 @@ class SourceAnalyzer:
                     confidence=0.6
                 ))
         
-        # Oracle without staleness check
-        if re.search(r"latestRoundData|latestAnswer", self.source):
-            if not re.search(r"updatedAt|answeredInRound|stale", self.source, re.IGNORECASE):
-                self.findings.append(Finding(
-                    id="DEFI-ORACLE-001",
-                    severity=Severity.HIGH,
-                    category=Category.ORACLE,
-                    title="Oracle price without staleness check",
-                    description="Chainlink price feed used without checking freshness",
-                    recommendation="Check updatedAt and answeredInRound values",
-                    confidence=0.8
-                ))
-    
+        # Oracle staleness — handled with higher confidence by _analyze_oracle_patterns().
+        # DEFI-ORACLE-001 removed to prevent duplicate findings.
+
+    def _analyze_oracle_patterns(self):
+        """
+        Detect oracle manipulation surface area.
+        Key signal: is the price used for anything high-stakes
+        (borrowing, liquidation, minting) vs just informational?
+        """
+        HIGH_STAKES_CONSUMERS = [
+            r"borrow\(", r"liquidat", r"mint\(", r"collateral",
+            r"maxLoan", r"getLPValue", r"getCollateralValue",
+        ]
+        ORACLE_READS = [
+            r"latestAnswer\(\)",
+            r"latestRoundData\(\)",
+            r"getReserves\(\)",
+            r"slot0\(\)",          # Uniswap V3 spot — highly manipulable
+            r"consult\(",
+            r"observe\(",
+        ]
+        TWAP_PROTECTIONS = [
+            r"observe\(\[0,\s*\d{3,}",  # observe with meaningful window
+            r"secondsAgo.*[6-9]\d\d|[1-9]\d{3,}",  # 600s+ window
+            r"timeWeighted",
+            r"TWAP",
+        ]
+
+        has_twap = any(
+            re.search(p, self.source, re.IGNORECASE) for p in TWAP_PROTECTIONS
+        )
+        has_high_stakes = any(
+            re.search(p, self.source, re.IGNORECASE) for p in HIGH_STAKES_CONSUMERS
+        )
+
+        for oracle_pattern in ORACLE_READS:
+            for match in re.finditer(oracle_pattern, self.source, re.IGNORECASE):
+                line_num = self.source[:match.start()].count("\n") + 1
+                context = self._get_snippet(line_num, 20)
+
+                # slot0() is always critical — it's pure spot price
+                is_slot0 = "slot0" in oracle_pattern
+                severity = (Severity.CRITICAL if (is_slot0 and has_high_stakes)
+                            else Severity.HIGH if has_high_stakes
+                            else Severity.MEDIUM)
+
+                if has_twap and not is_slot0:
+                    continue  # Protected
+
+                # Check staleness for Chainlink specifically
+                if "latestRoundData" in oracle_pattern:
+                    if not re.search(r"updatedAt|answeredInRound", context):
+                        self.findings.append(Finding(
+                            id="ORACLE-MANIP-003",
+                            severity=Severity.HIGH,
+                            category=Category.ORACLE,
+                            title="Chainlink feed without staleness check",
+                            description="latestRoundData() used but updatedAt not checked",
+                            recommendation="require(block.timestamp - updatedAt < MAX_DELAY)",
+                            line_number=line_num,
+                            code_snippet=self._get_snippet(line_num),
+                            confidence=0.9,
+                        ))
+
+                if has_high_stakes:
+                    self.findings.append(Finding(
+                        id=("ORACLE-MANIP-002" if "getReserves" in oracle_pattern
+                            else "ORACLE-MANIP-001"),
+                        severity=severity,
+                        category=Category.ORACLE,
+                        title="Manipulable price feed used for high-stakes operation",
+                        description=(
+                            f"{'Spot AMM price' if 'getReserves' in oracle_pattern else 'Oracle price'} "
+                            f"used for borrowing/liquidation/minting without TWAP protection"
+                        ),
+                        recommendation="Replace with TWAP (min 10-30 min window) for all valuation",
+                        line_number=line_num,
+                        code_snippet=self._get_snippet(line_num),
+                        confidence=0.85,
+                    ))
+
     def _analyze_upgrade_patterns(self):
         """Analyze upgradeability patterns with PROTECTION-FIRST approach."""
         
@@ -1735,6 +2348,884 @@ class SourceAnalyzer:
         
         return '\n'.join(body_lines) if body_lines else None
 
+    # ===================================================
+    # NEW SPECIALIZED ANALYZERS
+    # ===================================================
+
+    def _analyze_assembly(self):
+        """Analyze inline assembly (Yul) for unsafe patterns."""
+        # Find all assembly blocks
+        asm_pattern = re.compile(r"assembly\s*(?:\"[^\"]*\"\s*)?\{", re.MULTILINE)
+        
+        for match in asm_pattern.finditer(self.source):
+            line_num = self.source[:match.start()].count("\n") + 1
+            
+            # Get the assembly block body
+            asm_start = match.end()
+            brace_depth = 1
+            pos = asm_start
+            while pos < len(self.source) and brace_depth > 0:
+                if self.source[pos] == '{':
+                    brace_depth += 1
+                elif self.source[pos] == '}':
+                    brace_depth -= 1
+                pos += 1
+            asm_body = self.source[asm_start:pos]
+            
+            # Check for memory-safe annotation
+            context_before = self.source[max(0, match.start()-100):match.start()]
+            is_memory_safe = "memory-safe" in context_before
+            
+            # Dangerous patterns in assembly
+            if "extcodesize" in asm_body and "isContract" not in self.source[max(0,match.start()-200):match.start()]:
+                # extcodesize is 0 during constructor - unreliable for EOA check
+                self.findings.append(Finding(
+                    id="ASM-EXTCODESIZE",
+                    severity=Severity.MEDIUM,
+                    category=Category.ASSEMBLY,
+                    title="Unreliable isContract check via extcodesize",
+                    description="extcodesize returns 0 during constructor execution.  Cannot reliably distinguish EOA from contract.",
+                    recommendation="Do not rely on extcodesize for security checks. Use msg.sender == tx.origin for EOA checks (with caveats).",
+                    line_number=line_num,
+                    confidence=0.7
+                ))
+            
+            if "sstore" in asm_body and not is_memory_safe:
+                # Direct storage writes in assembly are dangerous
+                self.findings.append(Finding(
+                    id="ASM-SSTORE",
+                    severity=Severity.MEDIUM,
+                    category=Category.ASSEMBLY,
+                    title="Direct storage write in assembly",
+                    description="Direct SSTORE in assembly bypasses Solidity's storage layout safety. Incorrect slot calculation corrupts state.",
+                    recommendation="Use Solidity storage variables when possible. Document slot calculations thoroughly.",
+                    line_number=line_num,
+                    confidence=0.6
+                ))
+            
+            if re.search(r"calldatacopy|calldataload", asm_body) and "calldatasize" not in asm_body:
+                self.findings.append(Finding(
+                    id="ASM-CALLDATA",
+                    severity=Severity.LOW,
+                    category=Category.ASSEMBLY,
+                    title="Calldata access without size check",
+                    description="Reading calldata in assembly without checking calldatasize may read zero-padded data",
+                    recommendation="Verify calldatasize() before calldatacopy/calldataload",
+                    line_number=line_num,
+                    confidence=0.5
+                ))
+
+    def _analyze_erc_compliance(self):
+        """Check for common ERC compliance issues."""
+        # ERC-20: Missing return value in transfer/approve
+        if re.search(r"function\s+transfer\s*\(", self.source):
+            # Check if transfer returns bool
+            transfer_match = re.search(
+                r"function\s+transfer\s*\([^)]*\)\s*(external|public)[^{]*",
+                self.source
+            )
+            if transfer_match and "returns" not in transfer_match.group(0):
+                line_num = self.source[:transfer_match.start()].count("\n") + 1
+                if not self._is_in_interface(line_num):
+                    self.findings.append(Finding(
+                        id="ERC20-RETURN",
+                        severity=Severity.MEDIUM,
+                        category=Category.ERC_COMPLIANCE,
+                        title="ERC-20 transfer() missing return value",
+                        description="ERC-20 standard requires transfer() to return bool. Missing return breaks composability with SafeERC20.",
+                        recommendation="Add 'returns (bool)' to transfer function signature",
+                        line_number=line_num,
+                        confidence=0.8
+                    ))
+        
+        # ERC-721: Missing ERC-165 supportsInterface
+        if re.search(r"ERC721|ERC-721|ownerOf.*tokenURI", self.source):
+            if not re.search(r"supportsInterface", self.source):
+                self.findings.append(Finding(
+                    id="ERC721-165",
+                    severity=Severity.LOW,
+                    category=Category.ERC_COMPLIANCE,
+                    title="ERC-721 missing ERC-165 supportsInterface",
+                    description="ERC-721 contracts must implement ERC-165 supportsInterface for proper detection by wallets and marketplaces",
+                    recommendation="Implement supportsInterface() returning true for IERC721 interface ID",
+                    confidence=0.7
+                ))
+        
+        # ERC-20: Missing zero-address check in transfer
+        transfer_body = re.search(
+            r"function\s+transfer\s*\([^)]*\)\s*[^{]*\{([^}]+(?:\{[^}]*\}[^}]*)*)\}",
+            self.source, re.DOTALL
+        )
+        if transfer_body:
+            body = transfer_body.group(1)
+            if "address(0)" not in body and "zero address" not in body.lower():
+                line_num = self.source[:transfer_body.start()].count("\n") + 1
+                if not self._is_in_interface(line_num):
+                    self.findings.append(Finding(
+                        id="ERC20-ZERO",
+                        severity=Severity.LOW,
+                        category=Category.ERC_COMPLIANCE,
+                        title="ERC-20 transfer missing zero-address check",
+                        description="transfer() should prevent sending tokens to address(0) to avoid permanent loss",
+                        recommendation="Add require(to != address(0)) in transfer/transferFrom",
+                        line_number=line_num,
+                        confidence=0.6
+                    ))
+
+    def _analyze_signature_patterns(self):
+        """Analyze cryptographic signature usage patterns."""
+        # Check for ecrecover without ECDSA library
+        if re.search(r"ecrecover\s*\(", self.source):
+            if not re.search(r"ECDSA|SignatureChecker", self.source):
+                # Check if zero-address check exists
+                ecrecover_matches = list(re.finditer(r"ecrecover\s*\(", self.source))
+                for match in ecrecover_matches[:2]:
+                    line_num = self.source[:match.start()].count("\n") + 1
+                    context = self._get_snippet(line_num, 5)
+                    
+                    if "address(0)" not in context and "!= address(0)" not in context:
+                        self.findings.append(Finding(
+                            id="SIG-ECRECOVER",
+                            severity=Severity.CRITICAL,
+                            category=Category.SIGNATURE,
+                            title="Unchecked ecrecover return value",
+                            description="ecrecover returns address(0) on invalid signature. Without checking, any invalid signature is treated as from address(0).",
+                            recommendation="Use OpenZeppelin ECDSA.recover() or add require(recovered != address(0))",
+                            line_number=line_num,
+                            code_snippet=self._get_snippet(line_num, 3),
+                            confidence=0.9
+                        ))
+        
+        # Check for hash without domain separator (replay risk)
+        if re.search(r"keccak256\s*\(\s*abi\.encode(?:Packed)?\s*\(", self.source):
+            if re.search(r"ecrecover|ECDSA\.recover", self.source):
+                if not re.search(r"DOMAIN_SEPARATOR|EIP712|_domainSeparatorV4|block\.chainid", self.source):
+                    self.findings.append(Finding(
+                        id="SIG-REPLAY",
+                        severity=Severity.HIGH,
+                        category=Category.SIGNATURE,
+                        title="Signature hash missing chain ID / domain separator",
+                        description="Signed messages without domain separation can be replayed across chains or contracts",
+                        recommendation="Implement EIP-712 with DOMAIN_SEPARATOR including chainId and verifyingContract address",
+                        confidence=0.8
+                    ))
+
+    # ------------------------------------------------------------------
+    # Specialized analyzers (wired from academic-paper translations)
+    # ------------------------------------------------------------------
+
+    _SEV_MAP = {
+        "CRITICAL": Severity.CRITICAL,
+        "HIGH": Severity.HIGH,
+        "MEDIUM": Severity.MEDIUM,
+        "LOW": Severity.LOW,
+        "INFO": Severity.INFO,
+    }
+
+    def _analyze_cross_function_reentrancy(self):
+        """Run CrossFunctionReentrancyGraph and convert cycles to Findings."""
+        try:
+            graph = CrossFunctionReentrancyGraph(self.source)
+            cycles = graph.has_cycles()
+        except Exception as exc:          # defensive: never crash analyze()
+            logger.debug("CrossFunctionReentrancyGraph failed: %s", exc)
+            return
+        for cyc in cycles:
+            sev = self._SEV_MAP.get(cyc.get("severity", "HIGH"), Severity.HIGH)
+            self.findings.append(Finding(
+                id="REENT-GRAPH-001",
+                severity=sev,
+                category=Category.REENTRANCY,
+                title="Cross-function reentrancy cycle detected",
+                description=(
+                    f"State-dependence graph contains a cycle: {cyc.get('path')}. "
+                    f"Shared state variables: {', '.join(cyc.get('shared_vars', []))}. "
+                    "An external call in one function can reenter another function "
+                    "that reads/writes the same state before the first call settles."
+                ),
+                recommendation=(
+                    "Apply a global nonReentrant guard (ReentrancyGuard) or restructure "
+                    "the functions to follow the checks-effects-interactions pattern."
+                ),
+                confidence=0.65,          # structural heuristic, manual review required
+            ))
+
+    def _analyze_flash_loan_arbitrage(self):
+        """Run FlashLoanArbitrageAnalyzer and convert findings."""
+        try:
+            analyzer = FlashLoanArbitrageAnalyzer(self.source)
+            results = analyzer.analyze()
+        except Exception as exc:
+            logger.debug("FlashLoanArbitrageAnalyzer failed: %s", exc)
+            return
+        for r in results:
+            sev = self._SEV_MAP.get(r.get("severity", "MEDIUM"), Severity.MEDIUM)
+            self.findings.append(Finding(
+                id=r["id"],
+                severity=sev,
+                category=Category.FLASH_LOAN,
+                title=r["title"],
+                description=r["description"],
+                recommendation=r["recommendation"],
+                confidence=0.6,
+            ))
+
+    def _analyze_mev_sandwich(self):
+        """Run MEVSandwichAnalyzer and convert findings."""
+        try:
+            analyzer = MEVSandwichAnalyzer(self.source)
+            results = analyzer.analyze()
+        except Exception as exc:
+            logger.debug("MEVSandwichAnalyzer failed: %s", exc)
+            return
+        for r in results:
+            sev = self._SEV_MAP.get(r.get("severity", "MEDIUM"), Severity.MEDIUM)
+            self.findings.append(Finding(
+                id=r["id"],
+                severity=sev,
+                category=Category.MEV,
+                title=r["title"],
+                description=r["description"],
+                recommendation=r["recommendation"],
+                confidence=0.55,
+            ))
+
+
+# ===================================================
+# CROSS-FUNCTION REENTRANCY GRAPH ANALYZER
+# ===================================================
+
+class CrossFunctionReentrancyGraph:
+    """
+    Practical translation of the "periodic orbits in state space" idea.
+
+    Models a contract as a difference equation S_{n+k} = S_n and
+    tries to solve for reentrancy cycles with SymPy.  That requires symbolic
+    execution of arbitrary Solidity—infeasible without a full EVM model.
+
+    Instead, we build a lightweight directed *state-dependence graph*:
+    - One node per public/external function
+    - Edge A → B when function A makes an external call and function B reads
+      or writes a state variable that A also touches, without a reentrancy
+      lock between A's call site and B's state access.
+
+    Any *cycle* in this graph (including self-loops = classic reentrancy) is
+    a potential reentrancy path.  The analyzer is purely structural—it never
+    produces a false positive when a global nonReentrant guard is present.
+    """
+
+    # --- regex helpers ---
+    _FUNC_RE = re.compile(
+        r"function\s+(\w+)\s*\([^)]*\)\s*(?:external|public)(?:[^{]*)\{",
+        re.MULTILINE,
+    )
+    _EXT_CALL_RE = re.compile(
+        r"\.call\{|\.call\(|\.transfer\(|\.send\(|IFace\w*\(|IERC\d*\(|\.delegatecall\(",
+        re.IGNORECASE,
+    )
+    _STATE_WRITE_RE = re.compile(
+        r"\b(\w+)\s*[\-\+\*\/]?=(?!=)",   # assignment to named variable
+    )
+    _STATE_READ_RE = re.compile(
+        r"\b([a-z_]\w{2,})\s*[\[;,\)]",   # lower-case identifier used in expression
+    )
+    _GUARD_RE = re.compile(
+        # ONLY real reentrancy guards — NOT "lock" (matches token-locks),
+        # "block" (block.number/block.timestamp), etc.  Graph has GraphTokenLock
+        # everywhere and the loose regex was suppressing every finding.
+        r"\bnonReentrant\b"
+        r"|\bReentrancyGuard\b"
+        r"|\b_nonReentrantBefore\b"
+        r"|\b_nonReentrantAfter\b"
+        r"|\b_status\s*==\s*_NOT_ENTERED\b",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+
+    def _extract_function_bodies(self) -> Dict[str, str]:
+        """Return {funcName: body_source} for all external/public functions."""
+        bodies: Dict[str, str] = {}
+        matches = list(self._FUNC_RE.finditer(self.source))
+        for i, m in enumerate(matches):
+            name = m.group(1)
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(self.source)
+            bodies[name] = self.source[start:end]
+        return bodies
+
+    def _touched_vars(self, body: str) -> Set[str]:
+        reads  = {m.group(1) for m in self._STATE_READ_RE.finditer(body)}
+        writes = {m.group(1) for m in self._STATE_WRITE_RE.finditer(body)}
+        # Ignore obvious temporaries (single char, or Solidity keywords)
+        _KEYWORDS = {"if", "for", "in", "to", "at", "is", "do"}
+        return (reads | writes) - _KEYWORDS
+
+    def has_cycles(self) -> List[Dict[str, Any]]:
+        """
+        Return a list of cycle descriptors `{path, shared_vars, severity}`.
+        Empty list = no reentrancy cycles found.
+        """
+        if self._GUARD_RE.search(self.source):
+            return []   # Global guard covers all paths — no finding
+
+        bodies = self._extract_function_bodies()
+        if not bodies:
+            return []
+
+        # Build adjacency: func_a -> {func_b, ...} when:
+        #   - func_a makes an external call
+        #   - func_a and func_b share at least one state variable
+        var_map   = {f: self._touched_vars(b) for f, b in bodies.items()}
+        makes_call = {f for f, b in bodies.items() if self._EXT_CALL_RE.search(b)}
+
+        adj: Dict[str, Set[str]] = {f: set() for f in bodies}
+        for caller in makes_call:
+            for callee, c_vars in var_map.items():
+                if callee == caller:
+                    shared = var_map[caller] & c_vars
+                    if shared:
+                        adj[caller].add(caller)   # self-loop = classic reentrancy
+                else:
+                    shared = var_map[caller] & c_vars
+                    if len(shared) >= 2:           # require ≥2 shared vars to reduce noise
+                        adj[caller].add(callee)
+
+        # DFS cycle detection (Johnson's algorithm simplified for small graphs)
+        cycles: List[Dict[str, Any]] = []
+        visited: Set[str] = set()
+
+        def dfs(node: str, path: List[str], on_path: Set[str]) -> None:
+            on_path.add(node)
+            path.append(node)
+            for neighbour in adj.get(node, set()):
+                if neighbour in on_path:
+                    cycle_start = path.index(neighbour)
+                    seg = path[cycle_start:]
+                    shared = var_map[seg[0]] & var_map[seg[-1]]
+                    cycles.append({
+                        "path": " → ".join(seg + [neighbour]),
+                        "shared_vars": sorted(shared),
+                        "severity": "CRITICAL" if len(seg) == 1 else "HIGH",
+                    })
+                elif neighbour not in visited:
+                    dfs(neighbour, path, on_path)
+            on_path.discard(node)
+            path.pop()
+            visited.add(node)
+
+        for func in list(bodies.keys()):
+            if func not in visited:
+                dfs(func, [], set())
+
+        return cycles
+
+
+# ===================================================
+# FLASH LOAN ARBITRAGE PATH ANALYZER
+# ===================================================
+
+class FlashLoanArbitrageAnalyzer:
+    """
+    Practical translation of the "combinatorial species / cycle enumeration"
+    idea from the email.
+
+    The email builds a token-exchange graph and looks for cycles with
+    product-weight > 1 + flash_loan_fee.  That requires on-chain price data
+    and a live pool graph—impossible from source text alone.
+
+    From source text we can detect the *structural preconditions* that make
+    flash-loan arbitrage possible:
+    - Contract performs two or more token swaps in a single transaction
+      without updating its internal price/reserve state between them
+      (stale-price window)
+    - Contract accepts flash loans and executes arbitrary user logic before
+      repayment, without checking that the reserve invariant is restored
+    - Swap function lacks slippage protection (amountOut >= minAmountOut)
+      or circuit breaker, making profitable sandwich/arbitrage easy
+
+    No false positives: each check is suppressed when the corresponding
+    protection pattern is present.
+    """
+
+    # Swap / exchange patterns
+    _SWAP_RE = re.compile(
+        r"function\s+(\w*(?:swap|exchange|trade|buy|sell)\w*)\s*\([^)]*\)\s*(?:external|public)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # Flash-loan entry points
+    _FLASH_RE = re.compile(
+        r"function\s+(\w*(?:flashLoan|executeOperation|onFlashLoan|receiveFlashLoan|uniswapV2Call|pancakeCall)\w*)\s*\(",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # Slippage / min-amount-out check
+    _SLIPPAGE_RE = re.compile(
+        r"minAmount(?:Out)?|amountOutMin|minReturn|slippage|minReceived",
+        re.IGNORECASE,
+    )
+    # Invariant / k-value check
+    _INVARIANT_RE = re.compile(
+        r"k\s*=\s*|\bkLast\b|reserve0\s*\*\s*reserve1|getAmountOut",
+        re.IGNORECASE,
+    )
+    # Repayment verification — balanceOf + require anywhere in source is sufficient
+    _REPAY_RE = re.compile(
+        r"(?:require|assert)[^;]{0,300}(?:balance|repay)"
+        r"|(?:balance|repay)[^;]{0,200}(?:require|assert)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    # Circuit breaker
+    _BREAKER_RE = re.compile(
+        r"whenNotPaused|paused\(\)|maxExposure|dailyLimit|circuitBreaker",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+
+    def analyze(self) -> List[Dict[str, Any]]:
+        """
+        Return a list of arbitrage-risk findings.  Each entry has:
+            id, title, severity, description, recommendation
+        Returns empty list when all protections are present.
+        """
+        findings = []
+        swap_funcs   = [m.group(1) for m in self._SWAP_RE.finditer(self.source)]
+        flash_funcs  = [m.group(1) for m in self._FLASH_RE.finditer(self.source)]
+        has_slippage  = bool(self._SLIPPAGE_RE.search(self.source))
+        has_invariant = bool(self._INVARIANT_RE.search(self.source))
+        has_repay     = bool(self._REPAY_RE.search(self.source))
+        has_breaker   = bool(self._BREAKER_RE.search(self.source))
+
+        # Rule 1: Multi-swap contract with no slippage protection
+        if len(swap_funcs) >= 2 and not has_slippage:
+            findings.append({
+                "id": "MEV-ARBIT-001",
+                "title": "Multi-swap contract with no slippage protection",
+                "severity": "HIGH",
+                "description": (
+                    f"Contract exposes {len(swap_funcs)} swap functions "
+                    f"({', '.join(swap_funcs[:4])}) without amountOutMin / slippage "
+                    "checks.  An attacker can atomically route through multiple swaps "
+                    "to extract the price difference as arbitrage profit."
+                ),
+                "recommendation": (
+                    "Add minAmountOut parameter to every swap function and "
+                    "require(amountOut >= minAmountOut) before state settlement."
+                ),
+            })
+
+        # Rule 2: Flash-loan entry point without repayment invariant check
+        if flash_funcs and not has_repay:
+            findings.append({
+                "id": "MEV-ARBIT-002",
+                "title": "Flash loan callback missing repayment invariant",
+                "severity": "CRITICAL",
+                "description": (
+                    f"Flash loan entry point(s) ({', '.join(flash_funcs)}) do not "
+                    "verify that the reserve invariant is restored after the callback. "
+                    "An attacker can execute arbitrary trades inside the callback and "
+                    "exit profitably if the final balance check is absent."
+                ),
+                "recommendation": (
+                    "Always verify reserve invariant after callback: "
+                    "require(balance0 * balance1 >= k, 'invariant violated')."
+                ),
+            })
+
+        # Rule 3: Multi-swap + no circuit breaker (DoS / runaway arbitrage)
+        if len(swap_funcs) >= 2 and not has_breaker:
+            findings.append({
+                "id": "MEV-ARBIT-003",
+                "title": "AMM-style contract lacks circuit breaker",
+                "severity": "MEDIUM",
+                "description": (
+                    "Contract allows unlimited swap volume with no circuit breaker "
+                    "or per-block/per-period limit.  Large flash-loan funded arbitrage "
+                    "can drain the pool in a single block."
+                ),
+                "recommendation": (
+                    "Implement Pausable or per-block volume cap. "
+                    "Emit events for large swaps and monitor off-chain."
+                ),
+            })
+
+        return findings
+
+
+# ===================================================
+# MEV SANDWICH RESISTANCE ANALYZER
+# ===================================================
+
+class MEVSandwichAnalyzer:
+    """
+    Practical translation of the "sandwich homomorphisms / treewidth DP"
+    idea from the email.
+
+    The email counts injective graph homomorphisms from a 3-node sandwich
+    pattern into a mempool transaction graph—this requires live mempool data
+    and is not computable from source text.
+
+    From source text we can evaluate *sandwich resistance* by checking
+    whether the three defences that eliminate profitable sandwiches are
+    present for every swap-like function:
+
+    1. **Deadline**      — reject transactions held in mempool too long
+    2. **Min-amount-out** — ensure the victim gets at least N tokens (slippage cap)
+    3. **Commit-reveal** — hide the trade intent from front-runners
+
+    A swap function lacking ALL THREE is trivially sandwichable.
+    A swap function with at least deadline + min-amount-out is sandwich-resistant
+    in practice (commit-reveal is the gold standard but rarely used for UX reasons).
+
+    False-positive suppression:
+    - Functions that are internal/private are not externally sandwichable.
+    - Pure AMM pool contracts (Pair, Pool) are flagged at lower confidence
+      because slippage is the router's responsibility, not the pool's.
+    - If the contract imports a known safe router (UniswapV2Router02,
+      SwapRouter, etc.) the finding is suppressed.
+    """
+
+    # External/public swap-like function
+    _SWAP_FN_RE = re.compile(
+        r"function\s+(\w*(?:swap|trade|exchange|buy|sell|execute)\w*)\s*\([^)]*\)"
+        r"\s*(?:external|public)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # Deadline check
+    _DEADLINE_RE = re.compile(
+        r"\bdeadline\b|\bexpiry\b|\bvalidUntil\b|\bblock\.timestamp\s*<=",
+        re.IGNORECASE,
+    )
+    # Min-amount-out / slippage
+    _MIN_AMOUNT_RE = re.compile(
+        r"\bminAmount(?:Out)?\b|\bamountOutMin\b|\bminReturn\b|\bminReceived\b",
+        re.IGNORECASE,
+    )
+    # Commit-reveal
+    _COMMIT_REVEAL_RE = re.compile(
+        r"\bcommit\b|\bcommitHash\b|\breveal\b|\bthresholdEncrypt\b",
+        re.IGNORECASE,
+    )
+    # Known safe routers that handle slippage externally
+    _SAFE_ROUTER_RE = re.compile(
+        r"UniswapV[23]Router|SwapRouter|PancakeRouter|TraderJoe|CurveRouter",
+        re.IGNORECASE,
+    )
+    # Low-confidence pool contracts (slippage enforced by router)
+    _POOL_CONTRACT_RE = re.compile(
+        r"contract\s+\w*(?:Pair|Pool|AMM|Vault)\w*\s",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+
+    def analyze(self) -> List[Dict[str, Any]]:
+        """
+        Return one finding per sandwichable swap function.
+        Returns empty list when all swap functions are protected.
+        """
+        # Suppress entire contract if it uses a safe router
+        if self._SAFE_ROUTER_RE.search(self.source):
+            return []
+
+        is_pool = bool(self._POOL_CONTRACT_RE.search(self.source))
+        has_deadline   = bool(self._DEADLINE_RE.search(self.source))
+        has_min_amount = bool(self._MIN_AMOUNT_RE.search(self.source))
+        has_commit     = bool(self._COMMIT_REVEAL_RE.search(self.source))
+
+        fully_protected = (has_deadline and has_min_amount) or has_commit
+
+        swap_funcs = [m.group(1) for m in self._SWAP_FN_RE.finditer(self.source)]
+        if not swap_funcs or fully_protected:
+            return []
+
+        missing = []
+        if not has_deadline:
+            missing.append("deadline")
+        if not has_min_amount:
+            missing.append("minAmountOut")
+        if not has_commit:
+            missing.append("commit-reveal")
+
+        severity = "HIGH" if not is_pool else "MEDIUM"
+        confidence_note = "" if not is_pool else " (lower confidence — pool contract; slippage may be enforced by router)"
+
+        return [{
+            "id": "MEV-SANDWICH-001",
+            "title": "Swap function(s) vulnerable to sandwich attack",
+            "severity": severity,
+            "description": (
+                f"Function(s) {', '.join(swap_funcs[:5])} lack sandwich-attack "
+                f"resistance.  Missing protections: {', '.join(missing)}.  "
+                "A front-runner can place a buy before the victim's transaction "
+                "and a sell immediately after, profiting from the price impact."
+                + confidence_note
+            ),
+            "recommendation": (
+                "Add (1) deadline: require(block.timestamp <= deadline), "
+                "(2) minAmountOut: require(amountOut >= minAmountOut), "
+                "or (3) commit-reveal scheme.  Deadline + minAmountOut together "
+                "eliminate the profitable sandwich window."
+            ),
+            "functions": swap_funcs[:5],
+            "missing_protections": missing,
+        }]
+
+
+# ===================================================
+# DIAMOND STORAGE COLLISION ANALYZER
+# ===================================================
+
+class DiamondStorageCollision:
+    """A detected storage collision between two Diamond facets."""
+
+    def __init__(
+        self,
+        facet_a: str,
+        facet_b: str,
+        collision_type: str,   # "identical_namespace" | "sequential_overlap"
+        slot_literal: str,     # the keccak256("...") literal or "slot_0"
+        severity: str,
+        recommendation: str,
+    ) -> None:
+        self.facet_a = facet_a
+        self.facet_b = facet_b
+        self.collision_type = collision_type
+        self.slot_literal = slot_literal
+        self.severity = severity
+        self.recommendation = recommendation
+
+    def to_dict(self) -> dict:
+        return {
+            "facet_a": self.facet_a,
+            "facet_b": self.facet_b,
+            "collision_type": self.collision_type,
+            "slot_literal": self.slot_literal,
+            "severity": self.severity,
+            "recommendation": self.recommendation,
+        }
+
+
+class DiamondStorageAnalyzer:
+    """
+    Detect storage-layout collisions between Diamond (EIP-2535) facets.
+
+    The email's Gröbner-basis / SageMath approach models keccak256 as a
+    Boolean polynomial system and tries to find preimage collisions.  In
+    practice keccak256 preimage collisions are computationally infeasible;
+    the real-world Diamond storage bugs are much simpler:
+
+    1. **Identical namespace literal** — two facets call
+       ``keccak256("same.string")`` → identical slot (definite collision).
+    2. **Copy-paste namespace** — duplicate ``bytes32 constant STORAGE_SLOT``
+       values across facets.
+    3. **Sequential-slot facets** — facet uses plain ``uint256 x`` at slot 0
+       instead of a namespaced struct, colliding with every other facet's
+       slot 0.
+    4. **EIP-1967 reserved slot overlap** — user constant happens to equal a
+       well-known reserved slot (0x360894…, 0xb53127…, 0xa3f0ad…).
+
+    Usage::
+
+        facets = {
+            "FacetA": "contract FacetA { ... }",
+            "FacetB": "contract FacetB { ... }",
+        }
+        collisions = DiamondStorageAnalyzer(facets).analyze()
+    """
+
+    # EIP-1967 / OpenZeppelin reserved slots that must never be reused
+    EIP1967_RESERVED = {
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+        "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103",
+        "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50",
+        "0x4910fdfa16fed3260ed0e7147f7cc6da11a60208b5b9406d12a635614ffd9143",  # admin
+    }
+
+    # Pattern: bytes32 constant NAME = keccak256("literal");
+    #          bytes32 constant NAME = 0xhex…;
+    _SLOT_CONST_RE = re.compile(
+        r'bytes32\s+(?:internal\s+)?(?:private\s+)?constant\s+\w+'
+        r'\s*=\s*(?:keccak256\s*\(\s*"([^"]+)"\s*\)|'
+        r'(0x[0-9a-fA-F]{64}))',
+        re.MULTILINE,
+    )
+    # Pattern: keccak256("literal") not necessarily in a constant
+    _INLINE_KECCAK_RE = re.compile(
+        r'keccak256\s*\(\s*"([^"]+)"\s*\)',
+        re.MULTILINE,
+    )
+    # Sequential state variable at file scope (rough proxy for non-namespaced storage)
+    _SEQUENTIAL_VAR_RE = re.compile(
+        r"^\s*(?:uint256|uint|address|bool|bytes32|int256|int|mapping)\s+\w+",
+        re.MULTILINE,
+    )
+    # Namespace struct pattern (EIP-7201 / Diamond pattern)
+    _NAMESPACE_PATTERN_RE = re.compile(
+        r"struct\s+\w*Storage\w*\s*\{",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def __init__(self, facets: Dict[str, str]) -> None:
+        """
+        :param facets: ``{facet_name: solidity_source_code}``
+        """
+        self.facets = facets
+
+    def analyze(self) -> List[DiamondStorageCollision]:
+        """
+        Run all collision checks and return a list of
+        :class:`DiamondStorageCollision` objects (empty = no issues found).
+        """
+        collisions: List[DiamondStorageCollision] = []
+        collisions.extend(self._check_identical_namespace_literals())
+        collisions.extend(self._check_duplicate_hex_slots())
+        collisions.extend(self._check_reserved_slot_overlap())
+        collisions.extend(self._check_sequential_storage_facets())
+        return collisions
+
+    # ------------------------------------------------------------------
+    # Check 1: Two facets share the exact same keccak256("…") literal
+    # ------------------------------------------------------------------
+
+    def _check_identical_namespace_literals(self) -> List[DiamondStorageCollision]:
+        """
+        Same string literal → identical keccak256 output → slot collision.
+        This is the most common copy-paste mistake in Diamond facets.
+        """
+        # Map literal string → list of facet names that use it
+        literal_to_facets: Dict[str, List[str]] = {}
+        for name, source in self.facets.items():
+            for m in self._INLINE_KECCAK_RE.finditer(source):
+                lit = m.group(1)
+                literal_to_facets.setdefault(lit, []).append(name)
+
+        results = []
+        for lit, facet_list in literal_to_facets.items():
+            if len(facet_list) >= 2:
+                for i in range(len(facet_list)):
+                    for j in range(i + 1, len(facet_list)):
+                        results.append(DiamondStorageCollision(
+                            facet_a=facet_list[i],
+                            facet_b=facet_list[j],
+                            collision_type="identical_namespace",
+                            slot_literal=f'keccak256("{lit}")',
+                            severity="CRITICAL",
+                            recommendation=(
+                                f'Two facets both use keccak256("{lit}") as their storage '
+                                f"slot.  Every storage write in one facet overwrites the "
+                                f"other.  Give each facet a unique namespace, e.g. "
+                                f'"diamond.facet.{facet_list[i].lower()}".'
+                            ),
+                        ))
+        return results
+
+    # ------------------------------------------------------------------
+    # Check 2: Two facets share the same hard-coded hex slot constant
+    # ------------------------------------------------------------------
+
+    def _check_duplicate_hex_slots(self) -> List[DiamondStorageCollision]:
+        """
+        ``bytes32 constant SLOT = 0xabc…`` appearing in two facets with the
+        same hex value is a definite collision regardless of intent.
+        """
+        hex_to_facets: Dict[str, List[str]] = {}
+        for name, source in self.facets.items():
+            for m in self._SLOT_CONST_RE.finditer(source):
+                hex_val = m.group(2)
+                if hex_val:
+                    hex_to_facets.setdefault(hex_val.lower(), []).append(name)
+
+        results = []
+        for hex_val, facet_list in hex_to_facets.items():
+            if len(facet_list) >= 2:
+                for i in range(len(facet_list)):
+                    for j in range(i + 1, len(facet_list)):
+                        results.append(DiamondStorageCollision(
+                            facet_a=facet_list[i],
+                            facet_b=facet_list[j],
+                            collision_type="identical_namespace",
+                            slot_literal=hex_val,
+                            severity="CRITICAL",
+                            recommendation=(
+                                f"Duplicate hex storage slot {hex_val} across facets "
+                                f"{facet_list[i]} and {facet_list[j]}.  Each facet must "
+                                f"derive its slot from a unique string via keccak256."
+                            ),
+                        ))
+        return results
+
+    # ------------------------------------------------------------------
+    # Check 3: Slot constant collides with EIP-1967 reserved slots
+    # ------------------------------------------------------------------
+
+    def _check_reserved_slot_overlap(self) -> List[DiamondStorageCollision]:
+        """
+        A facet's storage slot constant matches an EIP-1967 reserved slot.
+        Writing there corrupts the proxy's implementation/admin pointer.
+        """
+        results = []
+        for name, source in self.facets.items():
+            for m in self._SLOT_CONST_RE.finditer(source):
+                hex_val = m.group(2)
+                if hex_val and hex_val.lower() in self.EIP1967_RESERVED:
+                    results.append(DiamondStorageCollision(
+                        facet_a=name,
+                        facet_b="<EIP-1967 proxy>",
+                        collision_type="reserved_slot_overlap",
+                        slot_literal=hex_val,
+                        severity="CRITICAL",
+                        recommendation=(
+                            f"Facet {name} uses the EIP-1967 reserved slot {hex_val}.  "
+                            "This slot is owned by the proxy for its implementation "
+                            "address or admin pointer.  Overwriting it breaks upgradeability."
+                        ),
+                    ))
+        return results
+
+    # ------------------------------------------------------------------
+    # Check 4: Facet uses sequential (non-namespaced) storage
+    # ------------------------------------------------------------------
+
+    def _check_sequential_storage_facets(self) -> List[DiamondStorageCollision]:
+        """
+        Any facet that declares top-level state variables without a
+        namespace struct is exposed to slot-0 collision with every other
+        such facet.  The Diamond specification requires that state live
+        inside a namespaced storage struct.
+        """
+        sequential_facets = []
+        for name, source in self.facets.items():
+            has_namespace = bool(self._NAMESPACE_PATTERN_RE.search(source))
+            has_sequential = bool(self._SEQUENTIAL_VAR_RE.search(source))
+            uses_any_slot = bool(
+                self._SLOT_CONST_RE.search(source)
+                or self._INLINE_KECCAK_RE.search(source)
+            )
+            if has_sequential and not has_namespace and not uses_any_slot:
+                sequential_facets.append(name)
+
+        results = []
+        for i in range(len(sequential_facets)):
+            for j in range(i + 1, len(sequential_facets)):
+                results.append(DiamondStorageCollision(
+                    facet_a=sequential_facets[i],
+                    facet_b=sequential_facets[j],
+                    collision_type="sequential_overlap",
+                    slot_literal="slot_0",
+                    severity="HIGH",
+                    recommendation=(
+                        f"Facets {sequential_facets[i]} and {sequential_facets[j]} both "
+                        "use sequential (non-namespaced) storage starting at slot 0.  "
+                        "In a Diamond proxy all state variables MUST live inside a "
+                        "namespaced struct loaded via assembly from a unique keccak256 "
+                        "slot (EIP-2535 / EIP-7201)."
+                    ),
+                ))
+        return results
 
 
 class ABIAnalyzer:
@@ -1817,6 +3308,248 @@ class ABIAnalyzer:
 
 
 # ===================================================
+# CONSISTENCY AUDITOR FRAMEWORK
+# ===================================================
+# Based on global-neutral contradiction classification.
+# Detects state inconsistencies (temporal, invariant, access control).
+
+class ContradictionType(Enum):
+    """Types of contradictions the auditor can detect."""
+    STATE_TRANSITION = "state_transition"
+    INVARIANT_VIOLATION = "invariant_violation"
+    TEMPORAL_ORDER = "temporal_order"
+    CALLBACK_EXPOSURE = "callback_exposure"
+    ACCESS_INCONSISTENCY = "access_inconsistency"
+    BALANCE_MISMATCH = "balance_mismatch"
+
+
+@dataclass
+class StateContradiction:
+    """
+    Immutable record of a proven state contradiction.
+    τ₁ (state A) contradicts τ₂ (state B).
+    """
+    id: str
+    tau1: str  # Description of state A
+    tau2: str  # Description of state B
+    tau1_value: Optional[Any] = None
+    tau2_value: Optional[Any] = None
+    proof_location: str = ""  # Line number or test reference
+    execution_context: str = ""  # callback, reentrancy, oracle, storage
+    category: str = ""  # oracle, access_control, balance
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+    def is_observable(self) -> bool:
+        """Check if contradiction is measurable (values differ)."""
+        return self.tau1_value is not None and self.tau2_value is not None and self.tau1_value != self.tau2_value
+
+
+class ContradictionClassifier:
+    """
+    Classifies already-detected contradictions.
+    Does NOT discover; only assesses severity and context.
+    """
+    SEVERITY_WEIGHTS = {
+        "CRITICAL": 1.0,
+        "HIGH": 0.7,
+        "MEDIUM": 0.4,
+        "LOW": 0.15,
+        "INFO": 0.05
+    }
+
+    CONTEXT_MAP = {
+        "callback": {
+            "category": "STATE_TRANSITION_EXPOSURE",
+            "description": "State read while being modified during callback",
+            "affected_patterns": ["flash_loans", "hooks", "oracle_updates"]
+        },
+        "reentrancy": {
+            "category": "CEI_VIOLATION",
+            "description": "Effects not finalized before external interaction",
+            "affected_patterns": ["withdrawals", "transfers", "token_callbacks"]
+        },
+        "oracle": {
+            "category": "TEMPORAL_INCONSISTENCY",
+            "description": "Oracle price differs between read points",
+            "affected_patterns": ["twap", "manipulation_resistance", "liquidation"]
+        },
+        "storage": {
+            "category": "STATE_ASSUMPTION_FAILURE",
+            "description": "Storage value contradicts expected invariant",
+            "affected_patterns": ["pausable", "access_control", "balance_tracking"]
+        }
+    }
+
+    def __init__(self, contradiction: StateContradiction):
+        self.contradiction = contradiction
+        self.classification = None
+
+    def classify(self) -> Dict[str, Any]:
+        """Classify contradiction by severity, context, and risk."""
+        severity = self._determine_severity()
+        context = self._determine_context()
+        risk = self._assess_risk()
+        guidance = self._generate_guidance(severity)
+
+        self.classification = {
+            "contradiction_id": self.contradiction.id,
+            "severity": severity,
+            "context": context,
+            "risk_assessment": risk,
+            "auditor_guidance": guidance,
+            "proof_location": self.contradiction.proof_location,
+            "classification_timestamp": datetime.utcnow().isoformat()
+        }
+        return self.classification
+
+    def _determine_severity(self) -> Dict[str, Any]:
+        """Determine severity based on observability and context."""
+        # CRITICAL: Observable difference
+        if self.contradiction.is_observable():
+            return {
+                "level": "CRITICAL",
+                "weight": self.SEVERITY_WEIGHTS["CRITICAL"],
+                "reason": f"τ₁ ≠ τ₂ (measurable difference: {self.contradiction.tau1_value} vs {self.contradiction.tau2_value})",
+                "action": "MUST_FIX_BEFORE_DEPLOYMENT"
+            }
+        
+        # HIGH: Callback/reentrancy context
+        if self.contradiction.execution_context in ["callback", "reentrancy"]:
+            return {
+                "level": "HIGH",
+                "weight": self.SEVERITY_WEIGHTS["HIGH"],
+                "reason": f"Contradiction in sensitive context: {self.contradiction.execution_context}",
+                "action": "REQUIRES_MITIGATION"
+            }
+        
+        # MEDIUM: Theoretical but conditions exist
+        return {
+            "level": "MEDIUM",
+            "weight": self.SEVERITY_WEIGHTS["MEDIUM"],
+            "reason": "Contradiction exists but requires specific conditions",
+            "action": "REVIEW_AND_DOCUMENT"
+        }
+
+    def _determine_context(self) -> Dict[str, Any]:
+        """Map execution context to affected patterns."""
+        context_key = self.contradiction.execution_context or "default"
+        return self.CONTEXT_MAP.get(context_key, {
+            "category": "GENERIC_CONTRADICTION",
+            "description": "Unclassified contradiction context",
+            "affected_patterns": ["review_required"]
+        })
+
+    def _assess_risk(self) -> Dict[str, Any]:
+        """Assess downstream risk factors."""
+        risk_factors = []
+
+        if self.contradiction.is_observable():
+            risk_factors.append("Observable in production environment")
+
+        if self.contradiction.execution_context == "callback":
+            risk_factors.append("Affects callback-sensitive protocols (Uniswap, Balancer, etc.)")
+
+        if self.contradiction.category == "oracle":
+            risk_factors.append("Can lead to liquidation exploits")
+            risk_factors.append("Price manipulation possible")
+
+        if self.contradiction.category == "access_control":
+            risk_factors.append("Unauthorized access possible")
+            risk_factors.append("Privilege escalation path")
+
+        return {
+            "level": self.classification["severity"]["level"] if self.classification else "UNKNOWN",
+            "factors": risk_factors,
+            "downstream_impact": self._estimate_downstream_impact()
+        }
+
+    def _estimate_downstream_impact(self) -> List[str]:
+        """Estimate which systems are affected."""
+        impacts = []
+        if self.contradiction.execution_context == "callback":
+            impacts.append("Protocols reading state during callbacks")
+            impacts.append("Hooks and flash loan systems")
+        if self.contradiction.category == "oracle":
+            impacts.append("Liquidation systems")
+            impacts.append("Position management")
+            impacts.append("Derivative pricing")
+        return impacts if impacts else ["Unknown - requires manual review"]
+
+    def _generate_guidance(self, severity: Dict) -> List[str]:
+        """Generate remediation guidance."""
+        guidance = []
+        guidance.append(f"Proof location: {self.contradiction.proof_location}")
+        guidance.append("Validation steps:")
+        guidance.append("  1. Reproduce with test suite")
+        guidance.append("  2. Verify τ₁ and τ₂ on network fork")
+        guidance.append("  3. Check all downstream state reads")
+
+        if self.contradiction.execution_context == "callback":
+            guidance.append("  4. Audit all callback handlers for state assumptions")
+            guidance.append("  5. Validate checks-effects-interactions (CEI) pattern")
+
+        if self.contradiction.category == "oracle":
+            guidance.append("  4. Check oracle read consistency")
+            guidance.append("  5. Test manipulation resistance")
+
+        guidance.append(f"Action: {severity['action']}")
+        return guidance
+
+
+class SolidityConsistencyAuditor:
+    """Main orchestrator for consistency auditing."""
+    
+    def __init__(self):
+        self.contradictions: List[StateContradiction] = []
+
+    def add_contradiction(self, contradiction: StateContradiction) -> None:
+        """Record a detected contradiction."""
+        self.contradictions.append(contradiction)
+
+    def add_contradictions(self, contradictions: List[StateContradiction]) -> None:
+        """Record multiple contradictions."""
+        self.contradictions.extend(contradictions)
+
+    def run_audit(self) -> Dict[str, Any]:
+        """Classify all contradictions and return audit report."""
+        classifications = []
+        
+        for contradiction in self.contradictions:
+            try:
+                classifier = ContradictionClassifier(contradiction)
+                classification = classifier.classify()
+                classifications.append(classification)
+            except Exception as e:
+                logger.error(f"Contradiction classification failed for {contradiction.id}: {e}")
+
+        # Calculate consistency score
+        severity_weights = {c["severity"]["weight"] for c in classifications}
+        total_weight = sum(severity_weights) if severity_weights else 0
+        max_weight = len(self.contradictions) * 1.0 if self.contradictions else 1.0
+        score = max(0, 1 - (total_weight / max_weight)) * 100
+
+        critical_count = sum(1 for c in classifications if c["severity"]["level"] == "CRITICAL")
+        high_count = sum(1 for c in classifications if c["severity"]["level"] == "HIGH")
+        medium_count = sum(1 for c in classifications if c["severity"]["level"] == "MEDIUM")
+
+        return {
+            "consistency_score": round(score, 2),
+            "contradictions": classifications,
+            "total_contradictions": len(self.contradictions),
+            "critical_count": critical_count,
+            "high_count": high_count,
+            "medium_count": medium_count,
+            "is_consistent": critical_count == 0,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    def clear(self) -> None:
+        """Reset for new audit run."""
+        self.contradictions.clear()
+
+
+
+# ===================================================
 # MAIN AUDITOR
 # ===================================================
 
@@ -1841,9 +3574,53 @@ class AdvancedAuditor:
         # Fetch contract data
         metadata = self._fetch_metadata(address)
         
+        # The address we actually audit (may differ if proxy)
+        audit_address = address
+        
         # Get ABI
         abi = self.client.get_contract_abi(address)
         abi_summary = {}
+        
+        # Get and analyze source
+        source_data = self.client.get_contract_source(address)
+        
+        # ── Proxy resolution ──
+        # If no source/ABI at this address, check if it's a proxy
+        # and resolve to the implementation for auditing.
+        if not source_data:
+            impl_address = self._resolve_proxy_implementation(address)
+            if impl_address:
+                metadata.proxy = True
+                metadata.implementation = impl_address
+                logger.info(f"Proxy detected: {address} → implementation {impl_address}")
+                findings.append(Finding(
+                    id="PROXY-INFO-001",
+                    severity=Severity.INFO,
+                    category=Category.UPGRADE,
+                    title="Upgradeable proxy contract",
+                    description=(
+                        f"Address {address} is a proxy. "
+                        f"Implementation resolved via EIP-1967 storage: {impl_address}"
+                    ),
+                    recommendation="Audit both proxy and implementation contracts"
+                ))
+                # Re-fetch source and ABI from the implementation
+                audit_address = impl_address
+                source_data = self.client.get_contract_source(impl_address)
+                abi = self.client.get_contract_abi(impl_address)
+                
+                # Check proxy initialisation state
+                init_state = self.client.check_proxy_initialized(address)
+                deploy_state = self.client.check_atomic_deployment(address)
+                metadata.initialized = init_state.get("initialized", False)
+                metadata.atomic_deploy = deploy_state.get("atomic")
+                metadata.historical_status = deploy_state.get("historical_status")
+                metadata.vulnerable_window_blocks = deploy_state.get("vulnerable_window_blocks")
+                metadata.vulnerable_window_seconds = deploy_state.get("vulnerable_window_seconds")
+                metadata.init_tx = deploy_state.get("init_tx")
+                metadata.init_block = deploy_state.get("init_block")
+        
+        # Process ABI
         if abi:
             analyzer = ABIAnalyzer(abi)
             abi_summary = analyzer.analyze()
@@ -1853,20 +3630,22 @@ class AdvancedAuditor:
                 severity=Severity.MEDIUM,
                 category=Category.CODE_QUALITY,
                 title="Contract not verified",
-                description="Contract source code is not verified on block explorer",
+                description=(
+                    f"Contract source code is not verified on block explorer"
+                    + (f" (proxy {address}, impl {audit_address})" if metadata.proxy else "")
+                ),
                 recommendation="Verify source code for transparency and trust"
             ))
         
-        # Get and analyze source
-        source_data = self.client.get_contract_source(address)
+        # Analyze source
         if source_data:
             metadata.verified = True
             metadata.name = source_data.get("ContractName")
             metadata.compiler = source_data.get("CompilerVersion")
             metadata.optimization = source_data.get("OptimizationUsed") == "1"
             
-            # Check for proxy
-            if source_data.get("Proxy") == "1":
+            # Check for proxy flag from explorer (may add info if not already detected)
+            if source_data.get("Proxy") == "1" and not metadata.proxy:
                 metadata.proxy = True
                 metadata.implementation = source_data.get("Implementation")
                 findings.append(Finding(
@@ -1883,7 +3662,6 @@ class AdvancedAuditor:
                 deploy_state = self.client.check_atomic_deployment(address)
                 metadata.initialized = init_state.get("initialized", False)
                 metadata.atomic_deploy = deploy_state.get("atomic")
-                # Historical analysis
                 metadata.historical_status = deploy_state.get("historical_status")
                 metadata.vulnerable_window_blocks = deploy_state.get("vulnerable_window_blocks")
                 metadata.vulnerable_window_seconds = deploy_state.get("vulnerable_window_seconds")
@@ -1899,6 +3677,11 @@ class AdvancedAuditor:
         # STATE-AWARE: Adjust severity for initialization findings if already initialized
         if getattr(metadata, 'initialized', False):
             findings = self._adjust_init_findings(findings, metadata)
+        
+        # Run consistency audit on extracted facts
+        if source_data:
+            consistency_findings = self._run_consistency_audit(source_code if source_code else "", metadata, findings)
+            findings.extend(consistency_findings)
         
         # Post-process findings: filter by confidence and deduplicate
         findings = self._filter_findings(findings, metadata.name)
@@ -1951,6 +3734,170 @@ class AdvancedAuditor:
                         f.confidence = min(f.confidence, 0.5)
         
         return unique
+    
+    def _resolve_proxy_implementation(self, address: str) -> Optional[str]:
+        """Resolve proxy → implementation address via EIP-1967 / EIP-1822 storage slots.
+
+        Checks three standard proxy storage slots:
+          1. EIP-1967 implementation slot
+          2. EIP-1967 beacon slot (then calls implementation() on beacon)
+          3. EIP-1822 (UUPS) logic slot
+
+        Returns the implementation address or None.
+        """
+        ZERO = "0" * 64
+        ZERO_ADDR = "0x" + "0" * 40
+
+        # EIP-1967 implementation slot
+        IMPL_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+        val = self.client.get_storage_at(address, IMPL_SLOT)
+        if val and val != "0x" + ZERO and len(val) >= 42:
+            impl = "0x" + val[-40:]
+            if impl.lower() != ZERO_ADDR:
+                logger.info(f"EIP-1967 impl slot → {impl}")
+                return impl
+
+        # EIP-1967 beacon slot → beacon.implementation()
+        BEACON_SLOT = "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50"
+        val = self.client.get_storage_at(address, BEACON_SLOT)
+        if val and val != "0x" + ZERO and len(val) >= 42:
+            beacon = "0x" + val[-40:]
+            if beacon.lower() != ZERO_ADDR:
+                # Call implementation() on the beacon (selector 0x5c60da1b)
+                impl_ret = self.client.call_function(beacon, "0x5c60da1b")
+                if impl_ret and len(impl_ret) >= 42:
+                    impl = "0x" + impl_ret[-40:]
+                    if impl.lower() != ZERO_ADDR:
+                        logger.info(f"EIP-1967 beacon {beacon} → impl {impl}")
+                        return impl
+
+        # EIP-1822 (UUPS) logic slot
+        LOGIC_SLOT = "0xc5f16f0fcc639fa48a6947836d9850f504798523bf8c9a3a87d5876cf622bcf7"
+        val = self.client.get_storage_at(address, LOGIC_SLOT)
+        if val and val != "0x" + ZERO and len(val) >= 42:
+            impl = "0x" + val[-40:]
+            if impl.lower() != ZERO_ADDR:
+                logger.info(f"EIP-1822 logic slot → {impl}")
+                return impl
+
+        # Last resort: call implementation() directly on the proxy (0x5c60da1b)
+        impl_ret = self.client.call_function(address, "0x5c60da1b")
+        if impl_ret and impl_ret != "0x" and len(impl_ret) >= 42:
+            impl = "0x" + impl_ret[-40:]
+            if impl.lower() != ZERO_ADDR:
+                logger.info(f"implementation() call → {impl}")
+                return impl
+
+        return None
+
+    def _run_consistency_audit(self, source_code: str, metadata: 'ContractMetadata', findings: List[Finding]) -> List[Finding]:
+        """
+        Extract state contradictions from source code patterns and classify.
+        Returns additional findings based on contradiction severity.
+        """
+        consistency_findings = []
+        
+        if not source_code:
+            return consistency_findings
+        
+        try:
+            auditor = SolidityConsistencyAuditor()
+            
+            # Extract potential contradictions from source code patterns
+            contradictions = self._extract_contradictions_from_source(source_code, metadata)
+            auditor.add_contradictions(contradictions)
+            
+            # Run classification audit
+            report = auditor.run_audit()
+            
+            # Convert classifications to findings
+            for classification in report.get("contradictions", []):
+                severity = self._severity_from_string(classification["severity"]["level"])
+                
+                consistency_findings.append(Finding(
+                    id=f"CONSIST-{classification['contradiction_id']}",
+                    severity=severity,
+                    category=Category.TSI_CALLBACK,
+                    title=f"State Contradiction: {classification['context']['category']}",
+                    description=f"{classification['context']['description']} - {classification['severity']['reason']}",
+                    recommendation=". ".join(classification["auditor_guidance"]),
+                    confidence=0.8 if severity != Severity.INFO else 0.5
+                ))
+            
+        except Exception as e:
+            logger.debug(f"Consistency audit failed: {e}")
+        
+        return consistency_findings
+    
+    def _extract_contradictions_from_source(self, source_code: str, metadata: 'ContractMetadata') -> List[StateContradiction]:
+        """
+        Extract potential state contradictions from source code by pattern matching.
+        Looks for patterns that may indicate τ₁ ≠ τ₂ scenarios.
+        """
+        contradictions = []
+        lines = source_code.split('\n')
+        
+        # Pattern set: (tau1_pattern, tau1_desc, tau2_pattern, tau2_desc, context, category)
+        contradiction_patterns = [
+            # Callback state exposure
+            (r"function\s+(\w+).*\{", "state before callback", r"\.call\{|\.delegatecall\{|\.transfer\(|\.send\(", 
+             "state modified after callback", "callback", "balance"),
+            
+            # Reentrancy: external call before state update
+            (r"require\s*\(\s*\w+\.transfer|require\s*\(\s*\w+\.send", "balance transferred",
+             r"\w+\s*=\s*(?:balance|amount)|totalSupply\s*[+\-*/]=", "balance updated after transfer",
+             "reentrancy", "balance"),
+            
+            # Pause/unpause without state check
+            (r"paused\s*=\s*true|emit.*Paused\(", "contract paused", r"paused\s*=\s*false|emit.*Unpaused\(",
+             "contract unpaused", "storage", "access_control"),
+            
+            # Lock/unlock patterns
+            (r"locked\s*=\s*true|^\s*if.*locked\s*return", "resource locked",
+             r"locked\s*=\s*false", "resource unlocked", "storage", "access_control"),
+            
+            # Oracle read at different points
+            (r"price\s*=\s*getPrice\(|rate\s*=\s*getRate\(", "oracle price read",
+             r"price\s+=\s+\w+|price\s+observes\s+", "oracle price changes", "oracle", "oracle"),
+        ]
+        
+        for i, line in enumerate(lines, start=1):
+            for tau1_pat, tau1_desc, tau2_pat, tau2_desc, context, category in contradiction_patterns:
+                if re.search(tau1_pat, line):
+                    # Look for contradictory pattern in following lines
+                    for j in range(i, min(i + 20, len(lines))):
+                        if re.search(tau2_pat, lines[j]):
+                            contradiction_id = f"TAOSC-{i:04d}-{j:04d}"
+                            contradictions.append(StateContradiction(
+                                id=contradiction_id,
+                                tau1=tau1_desc,
+                                tau2=tau2_desc,
+                                proof_location=f"{i}-{j}",
+                                execution_context=context,
+                                category=category
+                            ))
+                            break
+        
+        return contradictions
+    
+    def _severity_from_string(self, severity_str: str) -> Severity:
+        """Convert string severity to Severity enum."""
+        severity_map = {
+            "CRITICAL": Severity.CRITICAL,
+            "HIGH": Severity.HIGH,
+            "MEDIUM": Severity.MEDIUM,
+            "LOW": Severity.LOW,
+            "INFO": Severity.INFO,
+        }
+        return severity_map.get(severity_str, Severity.MEDIUM)
+    
+    def _check_supply_conservation(self, contradiction: StateContradiction) -> bool:
+        """Check supply conservation invariant."""
+        return contradiction.category != "balance" or contradiction.tau1_value is None
+    
+    def _check_access_control_consistency(self, contradiction: StateContradiction) -> bool:
+        """Check access control consistency invariant."""
+        return contradiction.category != "access_control" or contradiction.execution_context != "callback"
     
     def _adjust_init_findings(self, findings: List[Finding], metadata) -> List[Finding]:
         """

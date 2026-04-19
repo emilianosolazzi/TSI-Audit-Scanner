@@ -48,6 +48,13 @@ docs/
 outputs/
 scripts/
 
+# Local validation/testing utilities
+check_execute.py
+exploit_verifier.py
+finding_validator.py
+report_generator.py
+private_validation_lab/
+
 # JS TSI layer (not part of standalone service)
 contradiction-classifier.js
 contradiction-ledger.json
@@ -58,3 +65,6 @@ integration.test.js
 prediction.js
 generate_validation_report.js
 reproduce_*.js
+
+# Private local validation artifacts
+private_validation_lab/

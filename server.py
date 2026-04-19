@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import time
+import re
 import logging
 from datetime import datetime, timedelta
 from functools import wraps
@@ -24,10 +25,11 @@ except ImportError:
     from flask_cors import CORS
 
 # Local imports
-from config import Config, TIERS, SUPPORTED_CHAINS
-from advanced_auditor import AdvancedAuditor, ChainClient
+from config import Config, TIERS, SUPPORTED_CHAINS, parse_explorer_url
+from advanced_auditor import AdvancedAuditor, ChainClient, KNOWN_VULNERABILITIES
 from repo_scanner import RepoScanner, ScanStatus
 from scanner_scheduler import ScanScheduler, ScanTarget
+from report_generator import generate_markdown_report, generate_sarif_report
 
 # Initialize app
 app = Flask(__name__)
@@ -55,6 +57,31 @@ scheduler = ScanScheduler(
     db_path=os.environ.get("SCANNER_DB", "scan_history.db"),
     results_dir=os.environ.get("SCANNER_RESULTS", "scan_results"),
 )
+
+# ===================================================
+# INPUT VALIDATION
+# ===================================================
+
+# Strict Ethereum address pattern
+ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+# Allowed GitHub URL pattern (prevent SSRF/injection)
+REPO_URL_RE = re.compile(r"^https://github\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(?:\.git)?$")
+
+def validate_address(address: str) -> bool:
+    """Validate Ethereum address format."""
+    return bool(ADDRESS_RE.match(address))
+
+def validate_repo_url(url: str) -> bool:
+    """Validate GitHub repository URL to prevent SSRF."""
+    return bool(REPO_URL_RE.match(url))
+
+def validate_local_path(path: str) -> bool:
+    """Validate local path to prevent directory traversal."""
+    real = os.path.realpath(path)
+    allowed_base = os.path.realpath(
+        os.environ.get("SCANNER_WORKSPACE", os.path.join(os.getcwd(), "scanner_workspace"))
+    )
+    return real == allowed_base or real.startswith(allowed_base + os.sep)
 
 
 # ===================================================
@@ -175,7 +202,9 @@ def health():
         "status": "ok",
         "service": "Smart Contract Audit Service",
         "timestamp": datetime.now().isoformat(),
-        "version": "1.0.0"
+        "version": "2.0.0",
+        "patterns": len(KNOWN_VULNERABILITIES),
+        "chains": len(SUPPORTED_CHAINS),
     })
 
 
@@ -243,6 +272,10 @@ def audit_contract(address: str):
     chain = request.args.get("chain", "ethereum")
     full_audit = request.args.get("full", "false").lower() == "true"
     
+    # Validate address format
+    if not validate_address(address):
+        return jsonify({"error": "Invalid address", "message": "Must be a valid Ethereum address (0x + 40 hex chars)"}), 400
+    
     # Validate chain
     if chain not in SUPPORTED_CHAINS:
         return jsonify({
@@ -268,12 +301,80 @@ def audit_contract(address: str):
         # Log audit
         logger.info(f"Audit completed: {address} on {chain} (score: {report.security_score}, risk: {report.risk_level})")
         
-        return jsonify(report.to_dict())
+        report_data = report.to_dict()
+        
+        # Support multiple output formats
+        fmt = request.args.get("format", "json").lower()
+        if fmt == "markdown" or fmt == "md":
+            return generate_markdown_report(report_data), 200, {"Content-Type": "text/markdown; charset=utf-8"}
+        elif fmt == "sarif":
+            return jsonify(generate_sarif_report(report_data))
+        
+        return jsonify(report_data)
         
     except ValueError as e:
         return jsonify({"error": "Invalid input", "message": str(e)}), 400
     except Exception as e:
         logger.exception(f"Audit failed for {address}")
+        return jsonify({"error": "Audit failed", "message": str(e)}), 500
+
+
+@app.route("/audit/url", methods=["GET", "POST"])
+@require_feature("basic_audit")
+def audit_explorer_url():
+    """
+    Audit a contract from a block-explorer URL.
+
+    Accepts URLs like:
+        https://bscscan.com/address/0xB562127efDC97B417B3116efF2C23A29857C0F0B
+        https://etherscan.io/address/0x...
+        https://arbiscan.io/token/0x...
+
+    GET  /audit/url?url=<explorer_url>&format=json|markdown|sarif
+    POST /audit/url  {"url": "<explorer_url>"}
+    """
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        explorer_url = data.get("url", "")
+    else:
+        explorer_url = request.args.get("url", "")
+
+    if not explorer_url:
+        return jsonify({
+            "error": "Missing URL",
+            "message": "Provide a block-explorer URL via ?url= or JSON body {\"url\": \"...\"}",
+            "examples": [
+                "https://bscscan.com/address/0xB562127efDC97B417B3116efF2C23A29857C0F0B",
+                "https://etherscan.io/address/0xdAC17F958D2ee523a2206206994597C13D831ec7",
+                "https://arbiscan.io/address/0x...",
+            ]
+        }), 400
+
+    try:
+        chain, address = parse_explorer_url(explorer_url)
+    except ValueError as e:
+        return jsonify({"error": "Invalid explorer URL", "message": str(e)}), 400
+
+    try:
+        auditor = AdvancedAuditor(config.etherscan_api_key, chain)
+        report = auditor.audit(address)
+
+        logger.info(f"Explorer-URL audit: {chain}:{address} (score: {report.security_score})")
+
+        report_data = report.to_dict()
+
+        fmt = request.args.get("format", "json").lower()
+        if fmt in ("markdown", "md"):
+            return generate_markdown_report(report_data), 200, {"Content-Type": "text/markdown; charset=utf-8"}
+        elif fmt == "sarif":
+            return jsonify(generate_sarif_report(report_data))
+
+        return jsonify(report_data)
+
+    except ValueError as e:
+        return jsonify({"error": "Invalid input", "message": str(e)}), 400
+    except Exception as e:
+        logger.exception(f"Explorer-URL audit failed for {explorer_url}")
         return jsonify({"error": "Audit failed", "message": str(e)}), 500
 
 
@@ -408,9 +509,9 @@ def scan_repo():
     scope_paths = data.get("scope_paths")
     include_tests = data.get("include_tests", False)
 
-    # Basic URL validation
-    if not (repo_url.startswith("https://") or os.path.isdir(repo_url)):
-        return jsonify({"error": "URL must start with https:// or be a local path"}), 400
+    # Validate URL to prevent SSRF
+    if not validate_repo_url(repo_url):
+        return jsonify({"error": "Invalid URL", "message": "Only https://github.com/<owner>/<repo> URLs are accepted"}), 400
 
     try:
         result = scanner.scan_repo(
@@ -448,6 +549,12 @@ def scan_local():
 
     local_path = data["path"]
     if not os.path.isdir(local_path):
+        return jsonify({"error": f"Directory not found: {local_path}"}), 400
+
+    # Prevent directory traversal
+    real_path = os.path.realpath(local_path)
+    if ".." in local_path:
+        return jsonify({"error": "Directory traversal not allowed"}), 400
         return jsonify({"error": f"Directory not found: {local_path}"}), 400
 
     try:

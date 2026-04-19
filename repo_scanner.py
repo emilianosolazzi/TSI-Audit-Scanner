@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 logger = logging.getLogger("RepoScanner")
@@ -32,6 +32,7 @@ class ScanStatus(Enum):
     CLONING = "cloning"
     DISCOVERING = "discovering"
     ANALYZING = "analyzing"
+    VALIDATING = "validating"
     COMPLETE = "complete"
     FAILED = "failed"
 
@@ -75,11 +76,14 @@ class ScanResult:
     duration_seconds: float = 0
     files_scanned: int = 0
     findings: List[Dict] = field(default_factory=list)
+    validated_findings: List[Dict] = field(default_factory=list)
+    exploit_verifications: List[Dict] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     summary: Dict[str, Any] = field(default_factory=dict)
+    triage: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "repo": {
                 "url": self.repo.url,
                 "branch": self.repo.branch,
@@ -98,6 +102,17 @@ class ScanResult:
             "errors": self.errors,
             "summary": self.summary,
         }
+        # Phase 2: triage results
+        if self.triage:
+            d["triage"] = self.triage
+            # Replace raw findings with validated findings when available
+            if self.validated_findings:
+                d["findings"] = self.validated_findings
+                d["findings_count"] = len(self.validated_findings)
+        # Phase 3: exploit verification results
+        if self.exploit_verifications:
+            d["exploit_verifications"] = self.exploit_verifications
+        return d
 
 
 class RepoScanner:
@@ -143,7 +158,7 @@ class RepoScanner:
         Returns:
             ScanResult with all findings
         """
-        started = datetime.utcnow()
+        started = datetime.now(timezone.utc)
         result = ScanResult(
             repo=RepoMetadata(url=repo_url, local_path="", branch=branch),
             status=ScanStatus.CLONING,
@@ -174,11 +189,13 @@ class RepoScanner:
             result.status = ScanStatus.ANALYZING
             all_findings = []
             total_lines = 0
+            file_sources = {}  # rel_path -> source code
 
             for sol_file in sol_files:
                 try:
                     source = Path(sol_file.absolute_path).read_text(encoding="utf-8", errors="replace")
                     total_lines += source.count("\n") + 1
+                    file_sources[sol_file.path] = source
                     findings = self._analyze_source(source, sol_file)
                     all_findings.extend(findings)
                     result.files_scanned += 1
@@ -187,6 +204,39 @@ class RepoScanner:
 
             result.repo.total_lines = total_lines
             result.findings = all_findings
+
+            # 5. Validation phase — triage findings
+            result.status = ScanStatus.VALIDATING
+            all_sol = self._discover_solidity_files(local_path, scope_paths)
+            test_files = [f.absolute_path for f in all_sol if f.is_test]
+            try:
+                from finding_validator import FindingValidator
+                validator = FindingValidator(test_files=test_files)
+                validated = validator.validate_findings(all_findings, file_sources)
+                result.validated_findings = [v.to_dict() for v in validated]
+                result.triage = validator.build_triage_summary(validated)
+            except Exception as e:
+                logger.warning(f"Validation phase failed: {e}")
+                result.triage = {"error": str(e)}
+
+            # 6. Exploit verification — semantic analysis of confirm_first findings
+            try:
+                from exploit_verifier import verify_all_findings
+                verifications = verify_all_findings(all_findings, file_sources)
+                if verifications:
+                    result.exploit_verifications = [v.to_dict() for v in verifications]
+                    # Enrich validated findings with verification results
+                    ver_map = {v.finding_id: v for v in verifications}
+                    for vf in result.validated_findings:
+                        vid = vf.get("id", "")
+                        if vid in ver_map:
+                            vr = ver_map[vid]
+                            vf["verification"] = vr.to_dict()
+                            if vr.severity_adjustment:
+                                vf["severity_adjustment"] = vr.severity_adjustment
+            except Exception as e:
+                logger.warning(f"Exploit verification phase failed: {e}")
+
             result.status = ScanStatus.COMPLETE
 
             # Build summary
@@ -197,8 +247,8 @@ class RepoScanner:
             result.errors.append(str(e))
             logger.exception(f"Scan failed for {repo_url}")
 
-        finished = datetime.utcnow()
-        result.completed_at = finished.isoformat() + "Z"
+        finished = datetime.now(timezone.utc)
+        result.completed_at = finished.isoformat().replace("+00:00", "Z")
         result.duration_seconds = (finished - started).total_seconds()
         return result
 
@@ -210,12 +260,39 @@ class RepoScanner:
     # REPO MANAGEMENT
     # ------------------------------------------------------------------
 
+    def _detect_default_branch(self, repo_url: str) -> str:
+        """Auto-detect the default branch of a remote repo via ls-remote."""
+        clone_url = self._auth_url(repo_url)
+        try:
+            out = self._run_git(["git", "ls-remote", "--symref", clone_url, "HEAD"])
+            # Output: "ref: refs/heads/main\tHEAD\n..."
+            m = re.search(r"ref:\s+refs/heads/(\S+)", out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        # Fallback chain
+        for branch in ("main", "master", "develop"):
+            try:
+                self._run_git(["git", "ls-remote", "--exit-code", clone_url, branch])
+                return branch
+            except Exception:
+                continue
+        return "main"
+
     def _resolve_repo(self, repo_url: str, branch: str) -> str:
         """Clone repo or return local path."""
         # Local directory
         if os.path.isdir(repo_url):
             logger.info(f"Using local directory: {repo_url}")
             return os.path.abspath(repo_url)
+
+        # Auto-detect default branch when caller used the default
+        if branch == "main":
+            detected = self._detect_default_branch(repo_url)
+            if detected != branch:
+                logger.info(f"Auto-detected default branch: {detected}")
+                branch = detected
 
         # Git URL — clone into workspace
         repo_hash = hashlib.sha256(f"{repo_url}:{branch}".encode()).hexdigest()[:12]

@@ -17,13 +17,127 @@ import shutil
 import logging
 import subprocess
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Set
 from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------------------
+# AST node-type and JSON-key constants (avoids magic strings throughout)
+# ---------------------------------------------------------------------------
+NODE_TYPE_SOURCE_UNIT   = "SourceUnit"
+NODE_TYPE_YUL_BLOCK     = "YulBlock"
+
+KEY_NODE_TYPE           = "nodeType"
+KEY_NAME                = "name"
+KEY_NODES               = "nodes"
+KEY_CHILDREN            = "children"      # legacy solc (<0.4.11)
+KEY_ABS_PATH            = "absolutePath"
+KEY_AST                 = "ast"
+KEY_LEGACY_AST          = "legacyAST"     # solc <0.8
+KEY_ID                  = "id"
+KEY_CONTENTS            = "contents"
+KEY_CONTRACT_KIND       = "contractKind"
+KEY_SRC                 = "src"
+KEY_STATEMENTS          = "statements"
+KEY_GENERATED_SOURCES   = "generatedSources"
+KEY_EVM                 = "evm"
+KEY_BYTECODE            = "bytecode"
+KEY_DEPLOYED_BYTECODE   = "deployedBytecode"
+KEY_OBJECT              = "object"
+KEY_SOURCE_MAP          = "sourceMap"
+KEY_SOURCES             = "sources"
+KEY_CONTRACTS           = "contracts"
 
 logger = logging.getLogger("SourceAnalyzer")
 
 
+# ---------------------------------------------------------------------------
+# Solc AST wrapper
+# ---------------------------------------------------------------------------
+
+class SolcAST:
+    """
+    Unified wrapper over both modern solc AST (nodeType / nodes) and the
+    legacy format emitted by solc < 0.4.11 (name / children).
+    """
+
+    def __init__(self, ast: Dict[str, Any]) -> None:
+        self.ast = ast
+
+    @property
+    def node_type(self) -> str:
+        if KEY_NODE_TYPE in self.ast:
+            return self.ast[KEY_NODE_TYPE]
+        if KEY_NAME in self.ast:
+            return self.ast[KEY_NAME]
+        raise ValueError("AST node has neither 'nodeType' nor 'name'")
+
+    @property
+    def abs_path(self) -> Optional[str]:
+        return self.ast.get(KEY_ABS_PATH)
+
+    @property
+    def nodes(self) -> List[Dict[str, Any]]:
+        if KEY_NODES in self.ast:
+            return self.ast[KEY_NODES]
+        if KEY_CHILDREN in self.ast:
+            return self.ast[KEY_CHILDREN]
+        return []
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.ast.get(key, default)
+
+    def __getitem__(self, item: str) -> Any:
+        return self.ast[item]
+
+
+# ---------------------------------------------------------------------------
+# Source-mapping dataclasses
+# ---------------------------------------------------------------------------
+
 @dataclass
+class SourceMapping:
+    """
+    One entry from a solc source map (a semicolon-delimited list).
+    Encodes where in the Solidity source a given bytecode instruction came from.
+    """
+    solidity_file_idx: int   # index into the sources array (-1 = generated)
+    offset: int              # byte offset in the source file
+    length: int              # byte length
+    lineno: Optional[int]    # 1-based line number (None when auto-generated)
+    solc_mapping: str        # raw mapping string for this entry
+
+
+@dataclass
+class SourceCodeInfo:
+    """Exact source location resolved from a SourceMapping."""
+    filename: str
+    lineno: Optional[int]
+    code: str           # the Solidity snippet this mapping points to
+    solc_mapping: str   # raw mapping string
+
+
+class SolcSourceFile:
+    """
+    Represents a single Solidity source file as seen by the compiler.
+    Stores the filename, raw source text, and the set of source-map strings
+    that correspond to top-level contract definitions (used to identify
+    compiler-generated code regions).
+    """
+
+    def __init__(
+        self,
+        filename: str,
+        data: str,
+        full_contract_src_maps: Set[str],
+    ) -> None:
+        self.filename = filename
+        self.data = data
+        self.full_contract_src_maps = full_contract_src_maps
+
+
+# ---------------------------------------------------------------------------
+# Main compilation result
+# ---------------------------------------------------------------------------
 class CompilationResult:
     """Result of compiling a Solidity project or file."""
     success: bool
@@ -252,9 +366,10 @@ class SourceAnalyzer:
         ]
 
     def _walk_ast(self, node: Any, target_type: str, results: List):
-        """Walk AST tree collecting nodes of target type."""
+        """Walk AST tree collecting nodes of target type (handles both modern and legacy AST)."""
         if isinstance(node, dict):
-            if node.get("nodeType") == target_type:
+            # Support both modern 'nodeType' and legacy 'name' fields
+            if node.get(KEY_NODE_TYPE) == target_type or node.get(KEY_NAME) == target_type:
                 results.append(node)
             for value in node.values():
                 self._walk_ast(value, target_type, results)
@@ -291,3 +406,174 @@ class SourceAnalyzer:
                 continue
 
         return call_graph
+
+    # ------------------------------------------------------------------
+    # SOURCE MAP PARSING
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_full_contract_src_maps(ast: SolcAST) -> Set[str]:
+        """
+        Return the set of source-map strings ("offset:length:fileId") for all
+        top-level contract definitions in a source unit.  These mark regions
+        of bytecode that are compiler-generated boilerplate, not user code.
+        """
+        source_maps: Set[str] = set()
+        if ast.node_type == NODE_TYPE_SOURCE_UNIT:
+            for child in ast.nodes:
+                if child.get(KEY_CONTRACT_KIND) and KEY_SRC in child:
+                    source_maps.add(child[KEY_SRC])
+        elif ast.node_type == NODE_TYPE_YUL_BLOCK:
+            for child in ast.get(KEY_STATEMENTS, []):
+                if KEY_SRC in child:
+                    source_maps.add(child[KEY_SRC])
+        return source_maps
+
+    @staticmethod
+    def _get_generated_sources(
+        indices: Dict[int, SolcSourceFile],
+        evm_section: Dict[str, Any],
+    ) -> None:
+        """
+        Extract compiler-generated Yul sources from a bytecode section and
+        insert them into *indices* so they can be looked up by file ID.
+        """
+        for source in evm_section.get(KEY_GENERATED_SOURCES, []):
+            raw_ast = source.get(KEY_AST, {})
+            wrapped = SolcAST(raw_ast)
+            src_maps = SourceAnalyzer._get_full_contract_src_maps(wrapped)
+            indices[source[KEY_ID]] = SolcSourceFile(
+                source.get(KEY_NAME, "<generated>"),
+                source.get(KEY_CONTENTS, ""),
+                src_maps,
+            )
+
+    @classmethod
+    def build_source_index(
+        cls,
+        solc_output: Dict[str, Any],
+        input_file: str = "",
+    ) -> Dict[int, SolcSourceFile]:
+        """
+        Build a mapping from source file ID (int) to :class:`SolcSourceFile`
+        from a raw solc JSON output dict.
+
+        Handles:
+        * Regular source files (``sources`` key, modern + legacy AST)
+        * Compiler-generated Yul sources embedded in bytecode sections
+
+        :param solc_output: Parsed solc ``--standard-json`` output.
+        :param input_file:  Path used as fallback when ``absolutePath`` is absent.
+        :returns: Dict mapping source-file index → SolcSourceFile.
+        """
+        indices: Dict[int, SolcSourceFile] = {}
+
+        # Generated sources embedded in each contract's EVM sections
+        for file_contracts in solc_output.get(KEY_CONTRACTS, {}).values():
+            for contract_data in file_contracts.values():
+                evm = contract_data.get(KEY_EVM, {})
+                cls._get_generated_sources(indices, evm.get(KEY_BYTECODE, {}))
+                cls._get_generated_sources(indices, evm.get(KEY_DEPLOYED_BYTECODE, {}))
+
+        # Regular source files
+        for _fname, source_entry in solc_output.get(KEY_SOURCES, {}).items():
+            # Prefer modern AST, fall back to legacyAST
+            raw_ast = source_entry.get(KEY_AST) or source_entry.get(KEY_LEGACY_AST)
+            if raw_ast is None:
+                continue
+            wrapped = SolcAST(raw_ast)
+            src_maps = cls._get_full_contract_src_maps(wrapped)
+            abs_path = wrapped.abs_path or input_file
+
+            try:
+                data = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                # Inline content (standard-json) is not on disk; skip file read
+                data = source_entry.get(KEY_CONTENTS, "")
+
+            file_id = source_entry.get(KEY_ID)
+            if file_id is not None:
+                indices[file_id] = SolcSourceFile(abs_path, data, src_maps)
+
+        return indices
+
+    @staticmethod
+    def parse_source_map(
+        srcmap_str: str,
+        source_index: Dict[int, SolcSourceFile],
+    ) -> List[SourceMapping]:
+        """
+        Parse a solc source map string into a list of :class:`SourceMapping` objects.
+
+        The source map is a semicolon-delimited sequence of entries, each of the
+        form ``offset:length:fileIndex:jumpType:modifierDepth``.  Empty fields
+        inherit the value from the previous entry (per the solc specification).
+
+        :param srcmap_str:    The raw source-map string from solc output.
+        :param source_index:  Source file index built by :meth:`build_source_index`.
+        :returns: List of SourceMapping, one per bytecode instruction.
+        """
+        mappings: List[SourceMapping] = []
+        prev_parts = ["0", "0", "-1", "", ""]
+
+        for entry in srcmap_str.split(";"):
+            parts = entry.split(":")
+            # Merge with previous: empty field inherits
+            merged = [
+                parts[i] if i < len(parts) and parts[i] != "" else prev_parts[i]
+                for i in range(5)
+            ]
+            prev_parts = merged
+
+            try:
+                offset = int(merged[0])
+                length = int(merged[1])
+                idx    = int(merged[2])
+            except (ValueError, IndexError):
+                offset, length, idx = 0, 0, -1
+
+            # Determine line number (None for auto-generated / unknown file)
+            lineno: Optional[int] = None
+            sol_file = source_index.get(idx)
+            if idx != -1 and sol_file is not None:
+                src_key = f"{offset}:{length}:{idx}"
+                if src_key not in sol_file.full_contract_src_maps:
+                    try:
+                        data_bytes = sol_file.data.encode("utf-8")
+                        lineno = data_bytes[:offset].count(b"\n") + 1
+                    except Exception:
+                        pass
+
+            mappings.append(SourceMapping(idx, offset, length, lineno, entry))
+
+        return mappings
+
+    @staticmethod
+    def get_source_info(
+        mapping: SourceMapping,
+        source_index: Dict[int, SolcSourceFile],
+    ) -> Optional[SourceCodeInfo]:
+        """
+        Resolve a :class:`SourceMapping` to a :class:`SourceCodeInfo` object
+        containing the filename, line number, and the Solidity code snippet.
+
+        Returns ``None`` for compiler-generated / unmappable entries.
+        """
+        if mapping.solidity_file_idx == -1:
+            return None
+        sol_file = source_index.get(mapping.solidity_file_idx)
+        if sol_file is None:
+            return None
+        try:
+            data_bytes = sol_file.data.encode("utf-8")
+            snippet = data_bytes[
+                mapping.offset: mapping.offset + mapping.length
+            ].decode("utf-8", errors="ignore")
+        except Exception:
+            snippet = ""
+        return SourceCodeInfo(
+            filename=sol_file.filename,
+            lineno=mapping.lineno,
+            code=snippet,
+            solc_mapping=mapping.solc_mapping,
+        )
