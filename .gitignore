@@ -48,11 +48,14 @@ docs/
 outputs/
 scripts/
 
+# Bug bounty audits (local testing, not for submission)
+gmx/
+yearn/
+
 # Local validation/testing utilities
 check_execute.py
 exploit_verifier.py
 finding_validator.py
-report_generator.py
 private_validation_lab/
 
 # Bug bounty workspaces (local only, not committed)
