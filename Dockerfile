@@ -13,11 +13,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source
 COPY server.py config.py advanced_auditor.py \
-     repo_scanner.py source_analyzer.py scanner_scheduler.py \
+    repo_scanner.py source_analyzer.py scanner_scheduler.py \
+    report_generator.py \
      ./
 
 # Create directories for scanner workspace and results
-RUN mkdir -p scanner_workspace scan_results
+RUN mkdir -p scanner_workspace scan_results data
 
 # Default environment
 ENV AUDIT_ENV=production \

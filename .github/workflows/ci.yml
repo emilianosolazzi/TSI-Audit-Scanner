@@ -57,6 +57,16 @@ jobs:
       - name: Test Docker container
         run: |
           docker run -d --name test-service -p 8080:8080 solidity-audit-service
-          sleep 5
-          curl -f http://localhost:8080/health
+          healthy=0
+          for i in {1..20}; do
+            if curl -fsS http://localhost:8080/health; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
           docker stop test-service
+          if [ "$healthy" -ne 1 ]; then
+            docker logs test-service
+            exit 1
+          fi
