@@ -156,6 +156,7 @@ SUPPORTED_CHAINS = {
     "fantom":    {"chain_id": 250,   "name": "Fantom Opera"},
     "gnosis":    {"chain_id": 100,   "name": "Gnosis Chain"},
     "moonbeam":  {"chain_id": 1284,  "name": "Moonbeam"},
+    "etc":       {"chain_id": 61,    "name": "Ethereum Classic"},
 }
 
 # ===================================================

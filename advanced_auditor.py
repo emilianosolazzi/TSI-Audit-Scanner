@@ -929,6 +929,71 @@ KNOWN_VULNERABILITIES = {
         "recommendation": "Enforce minimum delay between oracle update and consumption",
         "exclude_if": ["require.*block.number", "lastUpdate"],
     },
+    # ===========================================
+    # STALE ACCOUNTING & SHARE DILUTION VULNERABILITIES
+    # Based on Yearn Finance audit findings (Jan 2026)
+    # Covers asynchronous state updates, strategy report windows,
+    # and share accounting during rebalance operations
+    # ===========================================
+    "STALE-001": {
+        "name": "Stale Share Price During Strategy Report",
+        "severity": Severity.CRITICAL,
+        "category": Category.LOGIC,
+        "pattern": r"(?:processReport|_harvest|_processReport|_reportGain|_reportLoss)[^}]*(?:convertToAssets|convertToShares|pricePerShare)",
+        "description": "Strategy report processing reads vault share price before debt updates. Attacker can deposit/withdraw at inflated/deflated price in the interim window.",
+        "recommendation": "Snapshot share price BEFORE strategy report. Update all debt/state atomically. Prevent deposits/withdrawals during report processing.",
+        "reference": "Yearn audit finding: YFI share dilution via harvest window manipulation",
+        "attack_vector": "SHARE_DILUTION"
+    },
+    "STALE-002": {
+        "name": "Share Accounting Without Debt Update Atomicity",
+        "severity": Severity.HIGH,
+        "category": Category.LOGIC,
+        "pattern": r"function\s+(?:processReport|updateDebt|rebalance)\s*\([^)]*\)[^}]*(?:balanceOf|totalAssets|shares)(?:(?!atomic|single|tx).)*\}(?:(?!burn|mint).)*",
+        "description": "Share/debt accounting spread across multiple operations without atomic guarantee. Intermediate state exposes share price inconsistency.",
+        "recommendation": "Wrap all share price-affecting operations in try-finally or use transactional semantics to guarantee atomicity.",
+        "reference": "Yearn audit: Non-atomic debt updates enable share dilution"
+    },
+    "STALE-003": {
+        "name": "LP Token Balance Expected After Deposit",
+        "severity": Severity.MEDIUM,
+        "category": Category.LOGIC,
+        "pattern": r"(?:deposit|_deposit|addLiquidity)\s*\([^)]*\)\s*;[^}]*(?:balanceOf|IERC721|onERC721Received)",
+        "description": "Deposit assumes LP token balance increases immediately after call. If pool state updates asynchronously or callback defers execution, balance check fails.",
+        "recommendation": "Measure actual balance delta: balanceAfter - balanceBefore, or handle deferred mints via callbacks.",
+        "reference": "Yearn/Euler delayed mint patterns"
+    },
+    "STALE-004": {
+        "name": "Rebase Token Balance During Accounting Window",
+        "severity": Severity.MEDIUM,
+        "category": Category.LOGIC,
+        "pattern": r"(?:harvest|processReport|rebalance)\s*\([^)]*\)[^}]*(?:balanceOf|underlying|asset)\s*\([^)]*\)",
+        "description": "Reading token balance during rebalance/harvest window. Rebasing tokens (stETH, rebase derivatives) can change balance mid-operation, causing accounting errors.",
+        "recommendation": "Use shares-based accounting instead of balance-based. Snapshot balances at operation start, compare at end.",
+        "reference": "Yearn/Lido integration: rebase during harvest"
+    },
+    # ===========================================
+    # PAUSE STATE EXPLOITATION VULNERABILITIES
+    # ===========================================
+    "PAUSE-001": {
+        "name": "Emergency Withdraw Bypasses Pause",
+        "severity": Severity.CRITICAL,
+        "category": Category.LOGIC,
+        "pattern": r"function\s+(?:emergencyWithdraw|rescue|sweep)\s*\([^)]*\)\s*(?:external|public)(?:(?!nonReentrant|whenNotPaused|_.*modifier).)*\{[^}]*transfer|send",
+        "description": "Emergency function can execute even when protocol is paused. Attacker exploits pause state to execute privileged operations.",
+        "recommendation": "Apply consistency: either emergency functions are NOT exit functions (just for recovery), OR they respect pause state. Document the invariant.",
+        "protection_check": "pause_state",
+        "attack_vector": "PAUSE_BYPASS"
+    },
+    "PAUSE-002": {
+        "name": "Rebalance/Liquidation During Pause",
+        "severity": Severity.HIGH,
+        "category": Category.LOGIC,
+        "pattern": r"function\s+(?:liquidate|rebalance|reindex|settle)\s*\([^)]*\)(?:(?!whenNotPaused|require.*!paused|_.*onlyWhen).)*\{[^}]*(?:transfer|burn|mint)",
+        "description": "Core liquidation or rebalancing function missing pause guard. Protocol is paused to prevent user operations, but liquidations/rebalances continue, exposing inconsistent state.",
+        "recommendation": "Add whenNotPaused or require(!paused()) to ensure rebalances halt when protocol is in emergency state.",
+        "protection_check": "pause_state"
+    },
 }
 
 # DeFi protocol signatures for detection
