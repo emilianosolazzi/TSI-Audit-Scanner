@@ -1,0 +1,16 @@
+{
+  "cases": [
+    {
+      "file": "reentrancy_vuln.sol",
+      "must_find": ["SWC-107"]
+    },
+    {
+      "file": "txorigin_vuln.sol",
+      "must_find": ["SWC-115"]
+    },
+    {
+      "file": "safe_ownable.sol",
+      "must_find": []
+    }
+  ]
+}

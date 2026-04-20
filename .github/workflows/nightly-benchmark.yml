@@ -1,0 +1,36 @@
+name: Nightly Benchmark
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run benchmark corpus
+        run: |
+          python scripts/run_benchmark.py \
+            --corpus tests/benchmark_corpus \
+            --output benchmarks/results/nightly.json \
+            --min-precision 0.80 \
+            --min-recall 0.80
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-benchmark-report
+          path: benchmarks/results/nightly.json

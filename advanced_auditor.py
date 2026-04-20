@@ -202,6 +202,16 @@ PROTECTION_PATTERNS = {
         r"getPastVotes",
         r"ERC20Votes",
     ],
+    # Pause-state protections
+    "pause_state": [
+        r"whenNotPaused",
+        r"whenPaused",
+        r"require\s*\([^)]*!paused",
+        r"require\s*\([^)]*paused",
+        r"Pausable",
+        r"_pause\s*\(",
+        r"_unpause\s*\(",
+    ],
 }
 
 # Known vulnerability patterns with CVE-style IDs
@@ -3391,7 +3401,7 @@ class ContradictionType(Enum):
 
 
 @dataclass
-class StateContradiction:
+class ConsistencyContradiction:
     """
     Immutable record of a proven state contradiction.
     τ₁ (state A) contradicts τ₂ (state B).
@@ -3447,7 +3457,7 @@ class ContradictionClassifier:
         }
     }
 
-    def __init__(self, contradiction: StateContradiction):
+    def __init__(self, contradiction: ConsistencyContradiction):
         self.contradiction = contradiction
         self.classification = None
 
@@ -3567,13 +3577,13 @@ class SolidityConsistencyAuditor:
     """Main orchestrator for consistency auditing."""
     
     def __init__(self):
-        self.contradictions: List[StateContradiction] = []
+        self.contradictions: List[ConsistencyContradiction] = []
 
-    def add_contradiction(self, contradiction: StateContradiction) -> None:
+    def add_contradiction(self, contradiction: ConsistencyContradiction) -> None:
         """Record a detected contradiction."""
         self.contradictions.append(contradiction)
 
-    def add_contradictions(self, contradictions: List[StateContradiction]) -> None:
+    def add_contradictions(self, contradictions: List[ConsistencyContradiction]) -> None:
         """Record multiple contradictions."""
         self.contradictions.extend(contradictions)
 
@@ -3915,7 +3925,7 @@ class AdvancedAuditor:
         
         return consistency_findings
     
-    def _extract_contradictions_from_source(self, source_code: str, metadata: 'ContractMetadata') -> List[StateContradiction]:
+    def _extract_contradictions_from_source(self, source_code: str, metadata: 'ContractMetadata') -> List[ConsistencyContradiction]:
         """
         Extract potential state contradictions from source code by pattern matching.
         Looks for patterns that may indicate τ₁ ≠ τ₂ scenarios.
@@ -3954,7 +3964,7 @@ class AdvancedAuditor:
                     for j in range(i, min(i + 20, len(lines))):
                         if re.search(tau2_pat, lines[j]):
                             contradiction_id = f"TAOSC-{i:04d}-{j:04d}"
-                            contradictions.append(StateContradiction(
+                            contradictions.append(ConsistencyContradiction(
                                 id=contradiction_id,
                                 tau1=tau1_desc,
                                 tau2=tau2_desc,
@@ -3977,11 +3987,11 @@ class AdvancedAuditor:
         }
         return severity_map.get(severity_str, Severity.MEDIUM)
     
-    def _check_supply_conservation(self, contradiction: StateContradiction) -> bool:
+    def _check_supply_conservation(self, contradiction: ConsistencyContradiction) -> bool:
         """Check supply conservation invariant."""
         return contradiction.category != "balance" or contradiction.tau1_value is None
     
-    def _check_access_control_consistency(self, contradiction: StateContradiction) -> bool:
+    def _check_access_control_consistency(self, contradiction: ConsistencyContradiction) -> bool:
         """Check access control consistency invariant."""
         return contradiction.category != "access_control" or contradiction.execution_context != "callback"
     

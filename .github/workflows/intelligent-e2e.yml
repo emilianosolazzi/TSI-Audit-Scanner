@@ -1,0 +1,72 @@
+name: Intelligent E2E Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: GitHub repository URL to scan
+        required: true
+        default: https://github.com/scroll-tech/usx-contracts
+      branch:
+        description: Git branch
+        required: true
+        default: main
+      max_confirmed_true:
+        description: Gate limit for confirmed true findings
+        required: true
+        default: "0"
+      max_critical_manual:
+        description: Gate limit for CRITICAL findings in needs_manual_review
+        required: true
+        default: "0"
+      max_high_manual:
+        description: Gate limit for HIGH findings in needs_manual_review
+        required: true
+        default: "3"
+  schedule:
+    - cron: "30 3 * * *"
+
+jobs:
+  scan-grade-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run intelligent E2E flow
+        run: |
+          python scripts/intelligent_e2e_flow.py \
+            --url "${{ github.event.inputs.repo_url || 'https://github.com/scroll-tech/usx-contracts' }}" \
+            --branch "${{ github.event.inputs.branch || 'main' }}" \
+            --outdir speed_tests/automation \
+            --max-confirmed-true "${{ github.event.inputs.max_confirmed_true || '0' }}" \
+            --max-critical-manual "${{ github.event.inputs.max_critical_manual || '0' }}" \
+            --max-high-manual "${{ github.event.inputs.max_high_manual || '3' }}"
+
+      - name: Add summary to workflow output
+        if: always()
+        run: |
+          if [ -f speed_tests/automation/intelligent_flow_summary.md ]; then
+            cat speed_tests/automation/intelligent_flow_summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intelligent-e2e-artifacts
+          path: |
+            speed_tests/automation/intelligent_flow_summary.json
+            speed_tests/automation/intelligent_flow_summary.md
+            speed_tests/automation/full_e2e_report.json
+            speed_tests/automation/full_e2e_report.md
+            speed_tests/automation/scan_result_full.json

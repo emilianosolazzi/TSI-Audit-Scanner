@@ -205,6 +205,41 @@ python scanner_scheduler.py list
 python scanner_scheduler.py run --interval 300
 ```
 
+## No-Touch Intelligent E2E Flow
+
+Run full scan -> semantic validation -> dedupe -> disposition -> grading in one command:
+
+```bash
+python scripts/intelligent_e2e_flow.py \
+  --url https://github.com/scroll-tech/usx-contracts \
+  --branch main \
+  --outdir speed_tests/automation \
+  --max-confirmed-true 0 \
+  --max-critical-manual 0 \
+  --max-high-manual 3
+```
+
+Outputs:
+- `speed_tests/automation/full_e2e_report.json`
+- `speed_tests/automation/full_e2e_report.md`
+- `speed_tests/automation/intelligent_flow_summary.json`
+- `speed_tests/automation/intelligent_flow_summary.md`
+
+If you post-process an existing scan in a different output folder, pass the original workspace so semantic continuation can still run:
+
+```bash
+python scripts/full_e2e_report.py \
+  --input-scan speed_tests/scroll_usx/scan_result_full.json \
+  --workspace-dir speed_tests/scroll_usx/workspace \
+  --outdir speed_tests/automation
+```
+
+CI gate behavior:
+- Exit code `0` when gates pass
+- Exit code `2` when gates fail (for pipeline blocking)
+
+You can also run this hands-off in GitHub Actions via `.github/workflows/intelligent-e2e.yml`.
+
 ## Architecture
 
 ```

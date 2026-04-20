@@ -22,7 +22,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run auditor tests
+        run: python -m pytest tests/test_auditor.py tests/test_repo_scanner_integration.py -q
 
       - name: Verify imports
         run: |

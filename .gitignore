@@ -62,6 +62,9 @@ private_validation_lab/
 # Local reports — PoC artifacts, crash logs, draft submissions (never commit)
 reports/
 
+# Local speed-test runs (never commit)
+speed_tests/
+
 # Test cache and runtime artifacts
 tests/__pycache__/
 .pytest_cache/

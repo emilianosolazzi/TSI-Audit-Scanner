@@ -1035,6 +1035,23 @@ class TestStrictEqualityVerifier:
         assert result.exploitable is False
         assert result.exploit_class == ExploitConfidence.DISPROVEN
 
+    def test_disproves_when_no_balance_comparison(self):
+        """Non-balance equality checks must not trigger DEFI-008."""
+        finding = {"id": "DEFI-008", "line_number": 5}
+        func_body = """
+        function setup(bytes32 root, bytes32 latestRoot) external {
+            if (root == latestRoot) revert InvalidDepositDataRoot();
+            if (msg.sender != owner) revert OnlyOwner();
+        }
+        """
+        result = self.verifier.verify_finding(
+            finding, func_body, func_body,
+            state_vars=["owner"],
+        )
+        assert result is not None
+        assert result.exploitable is False
+        assert result.exploit_class == ExploitConfidence.DISPROVEN
+
 
 class TestPrecisionLossVerifier:
     """Precision loss verifier tests."""
@@ -1142,6 +1159,142 @@ class TestStorageCollisionVerifier:
             finding, contract, contract,
         )
         assert result is not None
+
+
+class TestDelegatecallTargetVerifier:
+    """Delegatecall target trust verifier tests (ASM-002)."""
+
+    def setup_method(self):
+        self.verifier = ExploitVerifier()
+
+    def test_disproves_governance_gated_diamond_route(self):
+        finding = {"id": "ASM-002", "line_number": 10}
+        source = """
+        contract Diamond {
+            mapping(bytes4 => address) public facets;
+
+            function addFacet(address facet, bytes4[] calldata selectors) external onlyGovernance {
+                for (uint i = 0; i < selectors.length; i++) {
+                    facets[selectors[i]] = facet;
+                }
+            }
+
+            fallback() external payable {
+                address facet = facets[msg.sig];
+                if (facet == address(0)) revert();
+                assembly {
+                    let result := delegatecall(gas(), facet, 0, calldatasize(), 0, 0)
+                    returndatacopy(0, 0, returndatasize())
+                    switch result
+                    case 0 { revert(0, returndatasize()) }
+                    default { return(0, returndatasize()) }
+                }
+            }
+        }
+        """
+        result = self.verifier.verify_finding(finding, source, source)
+        assert result is not None
+        assert result.exploit_class == ExploitConfidence.DISPROVEN
+        assert result.exploitable is False
+
+    def test_confirms_user_controlled_delegate_target(self):
+        finding = {"id": "ASM-002", "line_number": 5}
+        func_body = """
+        function run(bytes calldata data, address target) external {
+            (bool ok, ) = target.delegatecall(data);
+            require(ok);
+        }
+        """
+        result = self.verifier.verify_finding(finding, func_body, func_body)
+        assert result is not None
+        assert result.exploitable is True
+        assert result.exploit_class == ExploitConfidence.CONFIRMED
+
+
+class TestPauseBypassVerifier:
+    """Pause bypass verifier tests (PAUSE-001)."""
+
+    def setup_method(self):
+        self.verifier = ExploitVerifier()
+
+    def test_disproves_when_no_pause_mechanism(self):
+        finding = {"id": "PAUSE-001", "line_number": 5}
+        source = """
+        contract NoPause {
+            function withdrawTokens(address token, address to, uint256 amount) external onlyAdmin {
+                IERC20(token).transfer(to, amount);
+            }
+        }
+        """
+        result = self.verifier.verify_finding(finding, source, source)
+        assert result is not None
+        assert result.exploit_class == ExploitConfidence.DISPROVEN
+        assert result.exploitable is False
+
+    def test_disproves_pause_guarded_flow(self):
+        finding = {"id": "PAUSE-001", "line_number": 5}
+        func_body = """
+        function requestUSDC(uint256 amount) external notPaused {
+            token.safeTransfer(msg.sender, amount);
+        }
+        """
+        contract_source = """
+        bool public paused;
+        modifier notPaused() { require(!paused, \"paused\"); _; }
+        """
+        result = self.verifier.verify_finding(finding, func_body, contract_source)
+        assert result is not None
+        assert result.exploit_class == ExploitConfidence.DISPROVEN
+        assert result.exploitable is False
+
+    def test_disproves_settlement_only_claim_flow(self):
+        finding = {"id": "PAUSE-001", "line_number": 5}
+        func_body = """
+        function claimUSDC() public nonReentrant {
+            if (outstandingWithdrawalRequests[msg.sender] == 0) revert();
+            uint256 claimableAmount = outstandingWithdrawalRequests[msg.sender];
+            outstandingWithdrawalRequests[msg.sender] -= claimableAmount;
+            USDC.safeTransfer(msg.sender, claimableAmount);
+        }
+        """
+        contract_source = """
+        bool public paused;
+        modifier notPaused() { require(!paused, \"paused\"); _; }
+        function requestUSDC(uint256 amount) public notPaused {
+            outstandingWithdrawalRequests[msg.sender] += amount;
+        }
+        """
+        result = self.verifier.verify_finding(finding, func_body, contract_source)
+        assert result is not None
+        assert result.exploit_class == ExploitConfidence.DISPROVEN
+        assert result.exploitable is False
+
+    def test_disproves_pause_guard_from_function_metadata(self):
+        from types import SimpleNamespace
+
+        finding = {"id": "PAUSE-001", "line_number": 150}
+        func_body = """
+        // Parser may provide body-only content without signature/modifiers.
+        token.safeTransfer(msg.sender, amount);
+        """
+        contract_source = """
+        bool public paused;
+        modifier notPaused() { require(!paused, \"paused\"); _; }
+        """
+        all_functions = [
+            SimpleNamespace(
+                name="requestUSDC",
+                line_start=120,
+                line_end=200,
+                modifiers=["nonReentrant", "onlyWhitelisted", "notPaused"],
+            )
+        ]
+        result = self.verifier.verify_finding(
+            finding, func_body, contract_source, all_functions=all_functions
+        )
+        assert result is not None
+        assert result.exploit_class == ExploitConfidence.DISPROVEN
+        assert result.exploitable is False
 
 
 # ===================================================
@@ -1659,6 +1812,10 @@ class TestExploitVerifierMapping:
         assert d["exploit_class"] == "confirmed"
         assert d["severity_adjustment"] == "upgrade_to_CRITICAL"
         assert d["poc_hint"] == "// test"
+
+    def test_mapping_contains_new_verifiers(self):
+        assert ExploitVerifier.VERIFIER_MAP["ASM-002"] == "delegatecall_target"
+        assert ExploitVerifier.VERIFIER_MAP["PAUSE-001"] == "pause_bypass"
 
 
 # ===================================================

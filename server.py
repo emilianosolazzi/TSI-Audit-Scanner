@@ -24,6 +24,11 @@ except ImportError:
     from flask import Flask, jsonify, request, g
     from flask_cors import CORS
 
+try:
+    import redis
+except ImportError:
+    redis = None
+
 # Local imports
 from config import Config, TIERS, SUPPORTED_CHAINS, parse_explorer_url
 from advanced_auditor import AdvancedAuditor, ChainClient, KNOWN_VULNERABILITIES
@@ -45,8 +50,145 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AuditService")
 
-# In-memory usage tracking (replace with Redis/DB in production)
-usage_tracker: Dict[str, Dict[str, Any]] = {}
+
+class UsageCounterStore:
+    """Persistent usage counters with Redis backend and in-memory fallback."""
+
+    def __init__(self, redis_url: str):
+        self._memory: Dict[str, Dict[str, Any]] = {}
+        self._client = None
+        self._backend = "memory"
+
+        if redis is None:
+            logger.warning("redis package unavailable, using in-memory usage counters")
+            return
+
+        try:
+            client = redis.from_url(redis_url, decode_responses=True)
+            client.ping()
+            self._client = client
+            self._backend = "redis"
+            logger.info("Using Redis-backed usage counters")
+        except Exception as exc:
+            logger.warning(f"Redis not available, using in-memory usage counters: {exc}")
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    def _normalize_identifier(self, identifier: Optional[str]) -> str:
+        return identifier or "anonymous"
+
+    def _redis_keys(self, identifier: str) -> tuple[str, str]:
+        safe_identifier = identifier.replace(" ", "_")
+        return (
+            f"usage:{safe_identifier}:minute",
+            f"usage:{safe_identifier}:day",
+        )
+
+    def _seconds_until_utc_midnight(self) -> int:
+        now = datetime.utcnow()
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return max(int((tomorrow - now).total_seconds()), 1)
+
+    def check_and_increment(self, identifier: Optional[str], minute_limit: int, day_limit: int) -> tuple[bool, str, Dict[str, int]]:
+        identifier = self._normalize_identifier(identifier)
+
+        if self._client is not None:
+            minute_key, day_key = self._redis_keys(identifier)
+            minute_count_raw = self._client.get(minute_key)
+            day_count_raw = self._client.get(day_key)
+
+            minute_count = int(minute_count_raw or 0)
+            day_count = int(day_count_raw or 0)
+
+            if minute_count >= minute_limit:
+                return False, f"Rate limit exceeded: {minute_limit}/minute", {
+                    "minute_count": minute_count,
+                    "day_count": day_count,
+                }
+            if day_count >= day_limit:
+                return False, f"Daily limit exceeded: {day_limit}/day", {
+                    "minute_count": minute_count,
+                    "day_count": day_count,
+                }
+
+            pipe = self._client.pipeline()
+            pipe.incr(minute_key)
+            pipe.ttl(minute_key)
+            pipe.incr(day_key)
+            pipe.ttl(day_key)
+            new_minute_count, minute_ttl, new_day_count, day_ttl = pipe.execute()
+
+            if minute_ttl is None or minute_ttl < 0:
+                self._client.expire(minute_key, 60)
+            if day_ttl is None or day_ttl < 0:
+                self._client.expire(day_key, self._seconds_until_utc_midnight())
+
+            return True, "", {
+                "minute_count": int(new_minute_count),
+                "day_count": int(new_day_count),
+            }
+
+        now = datetime.now()
+        tracker = self._memory.setdefault(identifier, {
+            "minute_count": 0,
+            "minute_start": now,
+            "day_count": 0,
+            "day_start": now.date(),
+        })
+
+        if (now - tracker["minute_start"]).seconds >= 60:
+            tracker["minute_count"] = 0
+            tracker["minute_start"] = now
+
+        if tracker["day_start"] != now.date():
+            tracker["day_count"] = 0
+            tracker["day_start"] = now.date()
+
+        if tracker["minute_count"] >= minute_limit:
+            return False, f"Rate limit exceeded: {minute_limit}/minute", {
+                "minute_count": tracker["minute_count"],
+                "day_count": tracker["day_count"],
+            }
+        if tracker["day_count"] >= day_limit:
+            return False, f"Daily limit exceeded: {day_limit}/day", {
+                "minute_count": tracker["minute_count"],
+                "day_count": tracker["day_count"],
+            }
+
+        tracker["minute_count"] += 1
+        tracker["day_count"] += 1
+
+        return True, "", {
+            "minute_count": tracker["minute_count"],
+            "day_count": tracker["day_count"],
+        }
+
+    def get_usage(self, identifier: Optional[str]) -> Dict[str, int]:
+        identifier = self._normalize_identifier(identifier)
+
+        if self._client is not None:
+            minute_key, day_key = self._redis_keys(identifier)
+            return {
+                "minute_count": int(self._client.get(minute_key) or 0),
+                "day_count": int(self._client.get(day_key) or 0),
+            }
+
+        tracker = self._memory.get(identifier)
+        if not tracker:
+            return {"minute_count": 0, "day_count": 0}
+
+        now = datetime.now()
+        minute_count = tracker["minute_count"] if (now - tracker["minute_start"]).seconds < 60 else 0
+        day_count = tracker["day_count"] if tracker["day_start"] == now.date() else 0
+        return {
+            "minute_count": minute_count,
+            "day_count": day_count,
+        }
+
+
+usage_store = UsageCounterStore(config.redis_url)
 
 # Scanner components
 scanner = RepoScanner(
@@ -312,43 +454,14 @@ def check_rate_limit(api_key: Optional[str], tier: str) -> tuple[bool, str]:
     """Check if request is within rate limits."""
     tier_config = TIERS.get(tier, TIERS["free"])
     limits = tier_config.rate_limits
-    
-    # Use IP for anonymous users
-    identifier = api_key or request.remote_addr
-    
-    now = datetime.now()
-    if identifier not in usage_tracker:
-        usage_tracker[identifier] = {
-            "minute_count": 0,
-            "minute_start": now,
-            "day_count": 0,
-            "day_start": now.date()
-        }
-    
-    tracker = usage_tracker[identifier]
-    
-    # Reset minute counter
-    if (now - tracker["minute_start"]).seconds >= 60:
-        tracker["minute_count"] = 0
-        tracker["minute_start"] = now
-    
-    # Reset day counter
-    if tracker["day_start"] != now.date():
-        tracker["day_count"] = 0
-        tracker["day_start"] = now.date()
-    
-    # Check limits
-    if tracker["minute_count"] >= limits.requests_per_minute:
-        return False, f"Rate limit exceeded: {limits.requests_per_minute}/minute"
-    
-    if tracker["day_count"] >= limits.requests_per_day:
-        return False, f"Daily limit exceeded: {limits.requests_per_day}/day"
-    
-    # Increment counters
-    tracker["minute_count"] += 1
-    tracker["day_count"] += 1
-    
-    return True, ""
+
+    identifier = api_key or request.remote_addr or "anonymous"
+    allowed, message, _ = usage_store.check_and_increment(
+        identifier,
+        limits.requests_per_minute,
+        limits.requests_per_day,
+    )
+    return allowed, message
 
 
 def require_feature(feature: str):
@@ -440,8 +553,8 @@ def get_usage():
     api_key = g.get("api_key")
     tier = g.get("tier", "free")
     
-    identifier = api_key or request.remote_addr
-    tracker = usage_tracker.get(identifier, {})
+    identifier = api_key or request.remote_addr or "anonymous"
+    tracker = usage_store.get_usage(identifier)
     tier_config = TIERS.get(tier, TIERS["free"])
     
     return jsonify({
@@ -455,7 +568,8 @@ def get_usage():
                 "used": tracker.get("day_count", 0),
                 "limit": tier_config.rate_limits.requests_per_day
             }
-        }
+        },
+        "counter_backend": usage_store.backend,
     })
 
 
