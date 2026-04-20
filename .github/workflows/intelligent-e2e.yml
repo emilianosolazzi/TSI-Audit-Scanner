@@ -70,3 +70,5 @@ jobs:
             speed_tests/automation/full_e2e_report.json
             speed_tests/automation/full_e2e_report.md
             speed_tests/automation/scan_result_full.json
+            speed_tests/automation/tsi_plugin_result.json
+            speed_tests/automation/tsi_plugin_test_output.log

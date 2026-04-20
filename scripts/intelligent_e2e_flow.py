@@ -11,12 +11,15 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+from tsi_plugin_runner import run_tsi_plugin
 
 
 def _utc_now() -> str:
@@ -124,9 +127,50 @@ def _build_gate_result(
     }
 
 
+def _build_counts_by_status(findings: List[Dict[str, Any]]) -> Dict[str, int]:
+    return dict(Counter((finding.get("disposition") or "unknown") for finding in findings))
+
+
+def _build_top_review_queue(findings: List[Dict[str, Any]], limit: int = 50) -> List[Dict[str, Any]]:
+    queue = [
+        finding
+        for finding in findings
+        if finding.get("disposition") in ("confirmed_true", "high_priority_candidate", "candidate", "needs_manual_review")
+    ]
+
+    sev_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1, "GAS": 0}
+    disp_rank = {
+        "confirmed_true": 4,
+        "high_priority_candidate": 3,
+        "needs_manual_review": 2,
+        "candidate": 1,
+    }
+
+    queue.sort(
+        key=lambda finding: (
+            disp_rank.get(finding.get("disposition") or "", 0),
+            sev_rank.get((finding.get("severity") or "INFO").upper(), 0),
+            1 if finding.get("source") == "forge_plugin" else 0,
+        ),
+        reverse=True,
+    )
+    return queue[:limit]
+
+
 def _render_markdown(summary: Dict[str, Any]) -> str:
+    forge_findings = summary.get("forge_findings", [])
     lines = [
         "# Intelligent E2E Flow Summary",
+        "## TSI Plugin",
+        "",
+        f"- Status: {summary.get('tsi_plugin', {}).get('status', 'not_run')}",
+        f"- Contract: {summary.get('tsi_plugin', {}).get('match_contract', 'n/a')}",
+        f"- Plugin dir: {summary.get('tsi_plugin', {}).get('plugin_dir', 'n/a')}",
+        f"- Result JSON: {summary.get('tsi_plugin', {}).get('result_path', 'n/a')}",
+        f"- Output log: {summary.get('tsi_plugin', {}).get('log_path', 'n/a')}",
+        f"- Findings JSON: {summary.get('tsi_plugin', {}).get('findings_path', 'n/a')}",
+        f"- Findings count: {summary.get('tsi_plugin', {}).get('findings_count', 0)}",
+        "",
         "",
         f"- Generated: {summary['generated_at']}",
         f"- Repo: {summary.get('repo_url') or 'n/a'}",
@@ -165,6 +209,22 @@ def _render_markdown(summary: Dict[str, Any]) -> str:
             lines.append(f"   - {item.get('title')}")
             lines.append(f"   - reason: {item.get('reason')}")
 
+    lines += [
+        "",
+        "## Forge Findings",
+        "",
+    ]
+
+    if not forge_findings:
+        lines.append("No structured Forge findings emitted.")
+    else:
+        for index, item in enumerate(forge_findings, 1):
+            lines.append(
+                f"{index}. {item.get('id')} | {item.get('severity')} | {item.get('adapter_name')} | {item.get('status')}"
+            )
+            lines.append(f"   - {item.get('title')}")
+            lines.append(f"   - reason: {item.get('reason')}")
+
     lines.append("")
     return "\n".join(lines)
 
@@ -187,6 +247,22 @@ def main() -> None:
         type=int,
         default=3,
         help="Gate limit for HIGH findings still in needs_manual_review",
+    )
+    parser.add_argument(
+        "--tsi-plugin-dir",
+        default="forge",
+        help="Path to Foundry TSI plugin harness",
+    )
+    parser.add_argument("--tsi-fork-url", help="Optional RPC URL for forked TSI execution")
+    parser.add_argument(
+        "--tsi-match-contract",
+        default="TSI_Aave_FlashLoan_Oracle",
+        help="Foundry --match-contract target for TSI plugin",
+    )
+    parser.add_argument(
+        "--tsi-enforce-pass",
+        action="store_true",
+        help="Fail the pipeline when the TSI plugin status is not pass",
     )
     args = parser.parse_args()
 
@@ -214,13 +290,39 @@ def main() -> None:
     report_data = json.loads(report_json_path.read_text(encoding="utf-8"))
 
     all_findings = list(report_data.get("all_deduped_findings", []) or [])
-    score, score_counts = _score_findings(all_findings)
+
+    tsi_plugin = run_tsi_plugin(
+        root_dir=root_dir,
+        outdir=outdir,
+        plugin_dir=Path(args.tsi_plugin_dir),
+        fork_url=args.tsi_fork_url,
+        match_contract=args.tsi_match_contract,
+    )
+
+    forge_findings = list(tsi_plugin.get("normalized_findings") or [])
+    merged_findings = [
+        {**finding, "source": finding.get("source", "repo_scanner")}
+        for finding in all_findings
+    ] + forge_findings
+    merged_findings_path = outdir / "native_merged_findings.json"
+    merged_findings_path.write_text(json.dumps(merged_findings, indent=2), encoding="utf-8")
+
+    score, score_counts = _score_findings(merged_findings)
     gate = _build_gate_result(
-        all_findings,
+        merged_findings,
         max_confirmed_true=args.max_confirmed_true,
         max_critical_manual=args.max_critical_manual,
         max_high_manual=args.max_high_manual,
     )
+
+    tsi_check = (not args.tsi_enforce_pass) or tsi_plugin.get("status") == "pass"
+    gate["checks"]["tsi_plugin_within_policy"] = tsi_check
+    gate["actual"]["tsi_plugin_status"] = tsi_plugin.get("status")
+    gate["limits"]["tsi_plugin_policy"] = "must_pass" if args.tsi_enforce_pass else "informational"
+    gate["pass"] = gate["pass"] and tsi_check
+
+    counts_by_status = _build_counts_by_status(merged_findings)
+    top_review_queue = _build_top_review_queue(merged_findings)
 
     summary = {
         "generated_at": _utc_now(),
@@ -231,9 +333,12 @@ def main() -> None:
         "report_md_path": str(outdir / "full_e2e_report.md"),
         "grade_score_10": score,
         "score_components": score_counts,
-        "counts_by_status": report_data.get("summary", {}).get("counts_by_status", {}),
+        "counts_by_status": counts_by_status,
         "gate": gate,
-        "top_review_queue": report_data.get("top_review_queue", []),
+        "tsi_plugin": tsi_plugin,
+        "forge_findings": forge_findings,
+        "native_merged_findings_path": str(merged_findings_path),
+        "top_review_queue": top_review_queue,
     }
 
     machine_summary_path = outdir / "intelligent_flow_summary.json"

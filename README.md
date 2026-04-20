@@ -97,6 +97,14 @@ python server.py
 python scanner_scheduler.py scan https://github.com/owner/repo --scope contracts/
 ```
 
+## Repository Layout (Canonical)
+
+- Core Python service (runtime + API): `server.py`, `advanced_auditor.py`, `repo_scanner.py`, `scanner_scheduler.py`, `source_analyzer.py`, `config.py`, `report_generator.py`, `finding_validator.py`, `exploit_verifier.py`
+- Canonical Foundry plugin package: `forge/`
+- Core automation and validation: `scripts/`, `tests/`
+- Non-core protocol research and historical workspaces: `research/`
+- Generated artifacts: `scan_results/`, `reports/`, `speed_tests/automation/`, `scanner_workspace/`
+
 ## Docker
 
 ```bash
@@ -224,6 +232,23 @@ Outputs:
 - `speed_tests/automation/full_e2e_report.md`
 - `speed_tests/automation/intelligent_flow_summary.json`
 - `speed_tests/automation/intelligent_flow_summary.md`
+- `speed_tests/automation/tsi_plugin_result.json`
+- `speed_tests/automation/tsi_plugin_test_output.log`
+
+TSI plugin integration options:
+
+```bash
+python scripts/intelligent_e2e_flow.py \
+  --input-scan speed_tests/scroll_usx/scan_result_full.json \
+  --outdir speed_tests/automation \
+  --tsi-plugin-dir forge \
+  --tsi-match-contract TSI_Aave_FlashLoan_Oracle \
+  --tsi-fork-url "$ETH_RPC_URL" \
+  --tsi-enforce-pass
+```
+
+- Without `--tsi-fork-url`, the plugin runs in local mode and safely reports `skipped` when fork-only tests cannot execute.
+- With `--tsi-enforce-pass`, the pipeline fails unless the TSI plugin status is `pass`.
 
 If you post-process an existing scan in a different output folder, pass the original workspace so semantic continuation can still run:
 
