@@ -47,6 +47,10 @@ canonical-proofs/
 docs/
 outputs/
 scripts/
+!scripts/
+!scripts/full_e2e_report.py
+!scripts/intelligent_e2e_flow.py
+!scripts/run_benchmark.py
 
 # Bug bounty audits (local testing, not for submission)
 gmx/
@@ -55,8 +59,6 @@ firedancer/
 
 # Local validation/testing utilities
 check_execute.py
-exploit_verifier.py
-finding_validator.py
 private_validation_lab/
 
 # Local reports — PoC artifacts, crash logs, draft submissions (never commit)
