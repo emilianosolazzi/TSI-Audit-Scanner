@@ -51,12 +51,21 @@ scripts/
 # Bug bounty audits (local testing, not for submission)
 gmx/
 yearn/
+firedancer/
 
 # Local validation/testing utilities
 check_execute.py
 exploit_verifier.py
 finding_validator.py
 private_validation_lab/
+
+# Local reports — PoC artifacts, crash logs, draft submissions (never commit)
+reports/
+
+# Test cache and runtime artifacts
+tests/__pycache__/
+.pytest_cache/
+audit_service.db
 
 # Bug bounty workspaces (local only, not committed)
 gmx/
