@@ -116,6 +116,16 @@ class SourceCodeInfo:
     solc_mapping: str   # raw mapping string
 
 
+@dataclass
+class VyperMatch:
+    """Single Vyper pattern match for non-Solidity repos."""
+    pattern: str
+    line_num: int
+    line_content: str
+    severity: str
+    message: str
+
+
 class SolcSourceFile:
     """
     Represents a single Solidity source file as seen by the compiler.
@@ -256,6 +266,262 @@ class SourceAnalyzer:
             return result.stdout.strip().split("\n")[0]
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # VYPER ANALYSIS (pattern-based)
+    # ------------------------------------------------------------------
+
+    def analyze_vyper_source(self, source: str, file_path: str = "") -> List[Dict[str, Any]]:
+        """
+        Analyze Vyper source using lightweight heuristics.
+        This is intentionally pattern-based until full Vyper AST support is added.
+        """
+        findings: List[Dict[str, Any]] = []
+        lines = source.split("\n")
+        bounded_iterables = self._extract_vyper_bounded_iterables(source)
+
+        findings.extend(self._find_vyper_unbounded_loops(lines, file_path, bounded_iterables))
+        findings.extend(self._find_vyper_unsafe_sends(source, lines, file_path))
+        findings.extend(self._find_vyper_external_write_functions(source, lines, file_path))
+        findings.extend(self._find_vyper_uninitialized_immutables(source, lines, file_path))
+        findings.extend(self._find_vyper_bootstrap_pricing_review(source, lines, file_path))
+        findings.extend(self._find_vyper_strategy_accounting_review(source, lines, file_path))
+
+        return findings
+
+    def _extract_vyper_bounded_iterables(self, source: str) -> Set[str]:
+        """Return variable names that are explicitly bounded via DynArray[..., MAX_*]."""
+        bounded: Set[str] = set()
+        pattern = re.compile(
+            r"(\w+)\s*:\s*(?:public\()?(?:DynArray)\[.*?,\s*([A-Z0-9_]+|\d+)\]\)?",
+            re.MULTILINE,
+        )
+        for match in pattern.finditer(source):
+            name = match.group(1)
+            bound = match.group(2)
+            if bound.isdigit() or bound.startswith("MAX_"):
+                bounded.add(name)
+                bounded.add(f"self.{name}")
+        return bounded
+
+    def _build_vyper_finding(
+        self,
+        finding_id: str,
+        severity: str,
+        severity_weight: int,
+        category: str,
+        title: str,
+        description: str,
+        recommendation: str,
+        file_path: str,
+        line_number: int,
+        lines: List[str],
+        confidence: float = 0.7,
+    ) -> Dict[str, Any]:
+        start = max(0, line_number - 2)
+        end = min(len(lines), line_number + 2)
+        snippet = "\n".join(lines[start:end])
+        return {
+            "id": finding_id,
+            "severity": severity,
+            "severity_weight": severity_weight,
+            "category": category,
+            "title": title,
+            "description": description,
+            "recommendation": recommendation,
+            "file": file_path,
+            "line_number": line_number,
+            "code_snippet": snippet,
+            "confidence": confidence,
+        }
+
+    def _find_vyper_unbounded_loops(self, lines: List[str], file_path: str, bounded_iterables: Set[str]) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        loop_pattern = re.compile(r"^\s*for\s+(\w+)\s+in\s+(.+?):")
+        for idx, line in enumerate(lines, 1):
+            match = loop_pattern.search(line)
+            if not match:
+                continue
+            iterable = match.group(2).strip()
+            is_bounded = False
+            if "range(" in iterable and re.search(r"range\((\d+)\)", iterable):
+                is_bounded = True
+            if "MAX_" in iterable or ("[" in iterable and "]" in iterable):
+                is_bounded = True
+            if iterable in bounded_iterables:
+                is_bounded = True
+            if iterable.startswith("self.") and iterable in bounded_iterables:
+                is_bounded = True
+            if is_bounded:
+                continue
+            findings.append(self._build_vyper_finding(
+                finding_id="VYPER-LOOP-001",
+                severity="MEDIUM",
+                severity_weight=40,
+                category="Denial of Service",
+                title="Potential Unbounded Loop",
+                description=f"Loop iterates over '{iterable}' without an obvious upper bound.",
+                recommendation="Enforce a max queue length or split work across bounded batches.",
+                file_path=file_path,
+                line_number=idx,
+                lines=lines,
+                confidence=0.8,
+            ))
+        return findings
+
+    def _find_vyper_unsafe_sends(self, source: str, lines: List[str], file_path: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        call_pattern = re.compile(r"(send|raw_call)\(")
+        for idx, line in enumerate(lines, 1):
+            if not call_pattern.search(line):
+                continue
+            window_start = max(0, idx - 8)
+            header = "\n".join(lines[window_start:idx])
+            if "@nonreentrant" in header:
+                continue
+            findings.append(self._build_vyper_finding(
+                finding_id="VYPER-REENTRANCY-001",
+                severity="HIGH",
+                severity_weight=70,
+                category="Reentrancy",
+                title="External Value Transfer Without Nonreentrant Guard",
+                description="send/raw_call appears in a function without a nearby @nonreentrant decorator.",
+                recommendation="Wrap state-changing external transfers with @nonreentrant and checks-effects-interactions.",
+                file_path=file_path,
+                line_number=idx,
+                lines=lines,
+                confidence=0.75,
+            ))
+        return findings
+
+    def _find_vyper_external_write_functions(self, source: str, lines: List[str], file_path: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        external_pattern = re.compile(r"^\s*@external\s*$")
+        func_pattern = re.compile(r"^\s*def\s+(\w+)\(")
+        standard_permissionless = {
+            "permit", "balanceOf", "totalSupply", "totalAssets", "totalIdle", "totalDebt",
+            "convertToShares", "previewDeposit", "previewMint", "convertToAssets", "maxDeposit",
+            "maxMint", "maxWithdraw", "maxRedeem", "previewWithdraw", "previewRedeem",
+            "get_default_queue", "isShutdown", "unlockedShares", "FACTORY", "apiVersion",
+            "profitMaxUnlockTime", "fullProfitUnlockDate", "profitUnlockingRate",
+            "lastProfitUpdate", "DOMAIN_SEPARATOR"
+        }
+        for idx, line in enumerate(lines, 1):
+            if not external_pattern.search(line):
+                continue
+            if idx >= len(lines):
+                continue
+            func_line = lines[idx]
+            func_match = func_pattern.search(func_line)
+            if not func_match:
+                continue
+            func_name = func_match.group(1)
+            if func_name == "__init__" or func_name.startswith("set_"):
+                continue
+            if func_name in standard_permissionless:
+                continue
+            decorator_window = "\n".join(lines[max(0, idx - 4):idx + 1])
+            signature_window = "\n".join(lines[idx - 1:min(len(lines), idx + 8)])
+            if "@view" in decorator_window or "@pure" in decorator_window or "->" in signature_window:
+                continue
+            body_lines: List[str] = []
+            for body_line in lines[idx + 1:]:
+                if body_line.startswith("def ") or body_line.startswith("@"):
+                    break
+                body_lines.append(body_line)
+            body = "\n".join(body_lines)
+            has_guard = any(token in body for token in [
+                "assert", "msg.sender", "role_manager", "only", "governance", "management"
+            ])
+            if has_guard:
+                continue
+            findings.append(self._build_vyper_finding(
+                finding_id="VYPER-ACCESS-001",
+                severity="MEDIUM",
+                severity_weight=40,
+                category="Access Control",
+                title="External Write Function Missing Explicit Guard",
+                description=f"@external function '{func_name}' does not show an obvious access-control check.",
+                recommendation="Confirm this function is intended to be permissionless or add an explicit sender/role check.",
+                file_path=file_path,
+                line_number=idx + 1,
+                lines=lines,
+                confidence=0.55,
+            ))
+        return findings
+
+    def _find_vyper_uninitialized_immutables(self, source: str, lines: List[str], file_path: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        immutable_pattern = re.compile(r"^(\w+):\s+immutable\((.+?)\)\s*$")
+        for idx, line in enumerate(lines, 1):
+            match = immutable_pattern.search(line)
+            if not match:
+                continue
+            var_name = match.group(1)
+            if re.search(rf"(?:self\.)?{re.escape(var_name)}\s*=", source):
+                continue
+            findings.append(self._build_vyper_finding(
+                finding_id="VYPER-INIT-001",
+                severity="LOW",
+                severity_weight=20,
+                category="Initialization",
+                title="Immutable May Not Be Initialized",
+                description=f"Immutable variable '{var_name}' does not appear to be assigned.",
+                recommendation="Verify that the immutable is assigned in __init__ or remove the declaration.",
+                file_path=file_path,
+                line_number=idx,
+                lines=lines,
+                confidence=0.5,
+            ))
+        return findings
+
+    def _find_vyper_bootstrap_pricing_review(self, source: str, lines: List[str], file_path: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        if "def _convert_to_shares" not in source:
+            return findings
+        if not re.search(r"if\s+total_supply\s*==\s*0\s*:\s*\n\s*return\s+assets", source, re.MULTILINE):
+            return findings
+        if any(token in source.lower() for token in ["virtual", "offset", "dead share", "dead_shares"]):
+            return findings
+
+        line_number = next((idx for idx, line in enumerate(lines, 1) if "def _convert_to_shares" in line), 1)
+        findings.append(self._build_vyper_finding(
+            finding_id="VYPER-ERC4626-001",
+            severity="LOW",
+            severity_weight=20,
+            category="Token Security",
+            title="ERC4626 Bootstrap Pricing Uses 1:1 Initial Mint",
+            description="Initial share minting returns assets 1:1 when total supply is zero and no virtual offset is visible.",
+            recommendation="Review first-depositor and donation-based inflation behavior and document whether this bootstrap model is intentional.",
+            file_path=file_path,
+            line_number=line_number,
+            lines=lines,
+            confidence=0.45,
+        ))
+        return findings
+
+    def _find_vyper_strategy_accounting_review(self, source: str, lines: List[str], file_path: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        if "convertToAssets(strategy_shares)" not in source:
+            return findings
+        if "gain = unsafe_sub(total_assets, current_debt)" not in source and "loss = unsafe_sub(current_debt, total_assets)" not in source:
+            return findings
+
+        line_number = next((idx for idx, line in enumerate(lines, 1) if "convertToAssets(strategy_shares)" in line), 1)
+        findings.append(self._build_vyper_finding(
+            finding_id="VYPER-ACCOUNTING-001",
+            severity="INFO",
+            severity_weight=5,
+            category="Business Logic",
+            title="Strategy Accounting Depends On Live convertToAssets",
+            description="Gain/loss accounting relies on strategy convertToAssets during report processing.",
+            recommendation="Review whether strategy asset conversion can be manipulated intra-block or during stressed unwind conditions.",
+            file_path=file_path,
+            line_number=line_number,
+            lines=lines,
+            confidence=0.4,
+        ))
+        return findings
 
     # ------------------------------------------------------------------
     # SOLC COMPILATION (single file or stdin)

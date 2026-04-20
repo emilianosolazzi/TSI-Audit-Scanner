@@ -43,6 +43,7 @@ class SolidityFile:
     path: str                   # Relative path within repo
     absolute_path: str          # Full filesystem path
     size_bytes: int
+    language: str = "solidity"
     pragma_version: Optional[str] = None
     contract_names: List[str] = field(default_factory=list)
     imports: List[str] = field(default_factory=list)
@@ -61,6 +62,7 @@ class RepoMetadata:
     commit_hash: Optional[str] = None
     framework: Optional[str] = None  # foundry, hardhat, truffle, brownie
     solidity_files: int = 0
+    vyper_files: int = 0
     total_lines: int = 0
     remappings: Dict[str, str] = field(default_factory=dict)
     dependencies: List[str] = field(default_factory=list)
@@ -90,6 +92,7 @@ class ScanResult:
                 "commit": self.repo.commit_hash,
                 "framework": self.repo.framework,
                 "solidity_files": self.repo.solidity_files,
+                "vyper_files": self.repo.vyper_files,
                 "total_lines": self.repo.total_lines,
             },
             "status": self.status.value,
@@ -177,13 +180,17 @@ class RepoScanner:
             result.repo.remappings = self._load_remappings(local_path)
             result.repo.dependencies = self._detect_dependencies(local_path)
 
-            # 3. Discover Solidity files
-            sol_files = self._discover_solidity_files(local_path, scope_paths)
-            result.repo.solidity_files = len(sol_files)
+            # 3. Discover source files
+            source_files = self._discover_source_files(local_path, scope_paths)
+            result.repo.solidity_files = sum(1 for f in source_files if f.language == "solidity")
+            result.repo.vyper_files = sum(1 for f in source_files if f.language == "vyper")
 
             # Filter tests/scripts unless requested
             if not include_tests:
-                sol_files = [f for f in sol_files if not f.is_test and not f.is_script]
+                source_files = [f for f in source_files if not f.is_test and not f.is_script]
+
+            # Skip Solidity interfaces by default; they generate declaration-only noise.
+            source_files = [f for f in source_files if not f.is_interface]
 
             # 4. Analyze each file
             result.status = ScanStatus.ANALYZING
@@ -191,24 +198,27 @@ class RepoScanner:
             total_lines = 0
             file_sources = {}  # rel_path -> source code
 
-            for sol_file in sol_files:
+            for source_file in source_files:
                 try:
-                    source = Path(sol_file.absolute_path).read_text(encoding="utf-8", errors="replace")
+                    source = Path(source_file.absolute_path).read_text(encoding="utf-8", errors="replace")
                     total_lines += source.count("\n") + 1
-                    file_sources[sol_file.path] = source
-                    findings = self._analyze_source(source, sol_file)
+                    file_sources[source_file.path] = source
+                    if source_file.language == "vyper":
+                        findings = self._analyze_vyper_source(source, source_file)
+                    else:
+                        findings = self._analyze_source(source, source_file)
                     all_findings.extend(findings)
                     result.files_scanned += 1
                 except Exception as e:
-                    result.errors.append(f"{sol_file.path}: {e}")
+                    result.errors.append(f"{source_file.path}: {e}")
 
             result.repo.total_lines = total_lines
             result.findings = all_findings
 
             # 5. Validation phase — triage findings
             result.status = ScanStatus.VALIDATING
-            all_sol = self._discover_solidity_files(local_path, scope_paths)
-            test_files = [f.absolute_path for f in all_sol if f.is_test]
+            all_source_files = self._discover_source_files(local_path, scope_paths)
+            test_files = [f.absolute_path for f in all_source_files if f.is_test]
             try:
                 from finding_validator import FindingValidator
                 validator = FindingValidator(test_files=test_files)
@@ -240,7 +250,7 @@ class RepoScanner:
             result.status = ScanStatus.COMPLETE
 
             # Build summary
-            result.summary = self._build_summary(all_findings, sol_files)
+            result.summary = self._build_summary(all_findings, source_files)
 
         except Exception as e:
             result.status = ScanStatus.FAILED
@@ -370,6 +380,8 @@ class RepoScanner:
         for filename, framework in checks:
             if os.path.exists(os.path.join(repo_dir, filename)):
                 return framework
+        if list(Path(repo_dir).rglob("*.vy")):
+            return "vyper"
         return None
 
     def _load_remappings(self, repo_dir: str) -> Dict[str, str]:
@@ -418,12 +430,12 @@ class RepoScanner:
         return deps
 
     # ------------------------------------------------------------------
-    # SOLIDITY FILE DISCOVERY
+    # SOURCE FILE DISCOVERY
     # ------------------------------------------------------------------
 
-    def _discover_solidity_files(self, repo_dir: str,
-                                  scope_paths: Optional[List[str]] = None) -> List[SolidityFile]:
-        """Walk the repo and find all .sol files."""
+    def _discover_source_files(self, repo_dir: str,
+                               scope_paths: Optional[List[str]] = None) -> List[SolidityFile]:
+        """Walk the repo and find all supported source files (.sol and .vy)."""
         files = []
         search_roots = [repo_dir]
 
@@ -440,40 +452,57 @@ class RepoScanner:
                 dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS]
 
                 for fname in filenames:
-                    if not fname.endswith(".sol"):
+                    if not (fname.endswith(".sol") or fname.endswith(".vy")):
                         continue
 
                     abs_path = os.path.join(dirpath, fname)
                     rel_path = os.path.relpath(abs_path, repo_dir)
+                    norm_rel_path = rel_path.replace("\\", "/")
+                    language = "vyper" if fname.endswith(".vy") else "solidity"
 
                     sol_file = SolidityFile(
                         path=rel_path,
                         absolute_path=abs_path,
                         size_bytes=os.path.getsize(abs_path),
+                        language=language,
                     )
 
                     # Classify
-                    sol_file.is_test = any(re.search(p, rel_path) for p in self.TEST_PATTERNS)
-                    sol_file.is_script = any(re.search(p, rel_path) for p in self.SCRIPT_PATTERNS)
+                    sol_file.is_test = any(re.search(p, norm_rel_path) for p in self.TEST_PATTERNS)
+                    sol_file.is_script = any(re.search(p, norm_rel_path) for p in self.SCRIPT_PATTERNS)
 
                     # Parse basic info from source
                     try:
                         source = Path(abs_path).read_text(encoding="utf-8", errors="replace")
-                        sol_file.pragma_version = self._extract_pragma(source)
-                        sol_file.contract_names = self._extract_contract_names(source)
-                        sol_file.imports = self._extract_imports(source)
-                        sol_file.is_interface = all(
-                            self._is_interface_name(n) for n in sol_file.contract_names
-                        ) if sol_file.contract_names else False
-                        sol_file.is_library = all(
-                            self._is_library(n, source) for n in sol_file.contract_names
-                        ) if sol_file.contract_names else False
+                        if language == "vyper":
+                            sol_file.contract_names = [Path(abs_path).stem]
+                            sol_file.imports = self._extract_vyper_imports(source)
+                            sol_file.is_interface = self._is_vyper_interface(norm_rel_path, source)
+                            sol_file.is_library = False
+                        else:
+                            sol_file.pragma_version = self._extract_pragma(source)
+                            sol_file.contract_names = self._extract_contract_names(source)
+                            sol_file.imports = self._extract_imports(source)
+                            sol_file.is_interface = all(
+                                self._is_interface_name(n) for n in sol_file.contract_names
+                            ) if sol_file.contract_names else False
+                            sol_file.is_library = all(
+                                self._is_library(n, source) for n in sol_file.contract_names
+                            ) if sol_file.contract_names else False
                     except Exception:
                         pass
 
                     files.append(sol_file)
 
         return files
+
+    def _discover_solidity_files(self, repo_dir: str,
+                                 scope_paths: Optional[List[str]] = None) -> List[SolidityFile]:
+        """Backward-compatible Solidity-only discovery helper."""
+        return [
+            source_file for source_file in self._discover_source_files(repo_dir, scope_paths)
+            if source_file.language == "solidity"
+        ]
 
     def _extract_pragma(self, source: str) -> Optional[str]:
         m = re.search(r"pragma\s+solidity\s+([^;]+);", source)
@@ -487,6 +516,17 @@ class RepoScanner:
     def _extract_imports(self, source: str) -> List[str]:
         return re.findall(r'import\s+["\']([^"\']+)["\']', source) + \
                re.findall(r'import\s+\{[^}]*\}\s+from\s+["\']([^"\']+)["\']', source)
+
+    def _extract_vyper_imports(self, source: str) -> List[str]:
+        imports = re.findall(r"(?:from\s+([^\s]+)\s+import\s+.+|import\s+([^\s]+))", source)
+        return [left or right for left, right in imports]
+
+    def _is_vyper_interface(self, rel_path: str, source: str) -> bool:
+        normalized = rel_path.replace("\\", "/").lower()
+        if "/interfaces/" in normalized or normalized.startswith("interfaces/"):
+            return True
+        stripped = source.lstrip()
+        return stripped.startswith("interface ")
 
     def _is_interface_name(self, name: str) -> bool:
         return name.startswith("I") and len(name) > 1 and name[1].isupper()
@@ -579,6 +619,13 @@ class RepoScanner:
 
         return findings
 
+    def _analyze_vyper_source(self, source: str, source_file: SolidityFile) -> List[Dict]:
+        """Run Vyper heuristics via SourceAnalyzer."""
+        from source_analyzer import SourceAnalyzer
+
+        analyzer = SourceAnalyzer()
+        return analyzer.analyze_vyper_source(source, source_file.path)
+
     # ------------------------------------------------------------------
     # SUMMARY
     # ------------------------------------------------------------------
@@ -621,6 +668,10 @@ class RepoScanner:
             "by_category": by_category,
             "top_files": dict(sorted(by_file.items(), key=lambda x: -x[1])[:10]),
             "contracts_scanned": [f.path for f in files if not f.is_test and not f.is_script],
+            "languages": {
+                "solidity": sum(1 for f in files if f.language == "solidity"),
+                "vyper": sum(1 for f in files if f.language == "vyper"),
+            },
             "interfaces_skipped": [f.path for f in files if f.is_interface],
             "tests_found": [f.path for f in files if f.is_test],
         }

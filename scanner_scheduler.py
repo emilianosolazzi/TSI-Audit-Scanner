@@ -18,6 +18,7 @@ import logging
 import sqlite3
 import hashlib
 import threading
+import requests
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any
@@ -76,6 +77,10 @@ class ScanScheduler:
         self.results_dir = results_dir
         self._running = False
         self._lock = threading.Lock()
+        self.alert_webhook_url = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
+        self.alert_webhook_timeout = float(os.environ.get("ALERT_WEBHOOK_TIMEOUT", "5"))
+        self.alert_webhook_retries = int(os.environ.get("ALERT_WEBHOOK_RETRIES", "2"))
+        self.alert_high_delta_threshold = int(os.environ.get("ALERT_HIGH_DELTA_THRESHOLD", "1"))
 
         os.makedirs(results_dir, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -122,7 +127,293 @@ class ScanScheduler:
             CREATE INDEX IF NOT EXISTS idx_history_target
             ON scan_history(target_id, completed_at)
         """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS alert_events (
+                alert_key TEXT PRIMARY KEY,
+                target_id TEXT NOT NULL,
+                scan_id TEXT,
+                created_at TEXT,
+                severity TEXT,
+                title TEXT,
+                payload TEXT,
+                status TEXT,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                delivered_at TEXT
+            )
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alert_target
+            ON alert_events(target_id, created_at)
+        """)
         self._conn.commit()
+
+    def _load_risk_level(self, record: ScanRecord) -> Optional[str]:
+        """Load risk level from persisted result file when available."""
+        if not record.result_path:
+            return None
+        try:
+            data = json.loads(Path(record.result_path).read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            return None
+        scores = data.get("scores")
+        if isinstance(scores, dict):
+            return scores.get("risk_level")
+        return None
+
+    def _risk_rank(self, level: Optional[str]) -> int:
+        return {
+            "SAFE": 0,
+            "LOW": 1,
+            "MEDIUM": 2,
+            "HIGH": 3,
+            "CRITICAL": 4,
+        }.get((level or "").upper(), -1)
+
+    def _make_alert_key(self, target_id: str, alert: Dict[str, Any]) -> str:
+        delta = alert.get("delta", {})
+        basis = (
+            f"{target_id}|{delta.get('critical', 0)}|{delta.get('high', 0)}|"
+            f"{delta.get('findings', 0)}|{alert.get('risk_transition', '')}"
+        )
+        return hashlib.sha256(basis.encode()).hexdigest()[:32]
+
+    def _get_alert_event(self, alert_key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT alert_key, status, attempts, last_error, delivered_at
+                   FROM alert_events WHERE alert_key = ?""",
+                (alert_key,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "alert_key": row[0],
+            "delivery_status": row[1],
+            "delivery_attempts": row[2],
+            "delivery_error": row[3],
+            "delivered_at": row[4],
+        }
+
+    def _record_alert_event(
+        self,
+        alert_key: str,
+        target_id: str,
+        scan_id: Optional[str],
+        severity: str,
+        title: str,
+        payload: Dict[str, Any],
+        status: str,
+        attempts: int,
+        last_error: Optional[str] = None,
+        delivered_at: Optional[str] = None,
+    ):
+        created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO alert_events
+                   (alert_key, target_id, scan_id, created_at, severity, title,
+                    payload, status, attempts, last_error, delivered_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    alert_key,
+                    target_id,
+                    scan_id,
+                    created_at,
+                    severity,
+                    title,
+                    json.dumps(payload),
+                    status,
+                    attempts,
+                    last_error,
+                    delivered_at,
+                ),
+            )
+            self._conn.commit()
+
+    def list_alert_events(
+        self,
+        target_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """List persisted alert delivery events."""
+        query = (
+            "SELECT alert_key, target_id, scan_id, created_at, severity, title, "
+            "status, attempts, last_error, delivered_at "
+            "FROM alert_events"
+        )
+        conditions: List[str] = []
+        params: List[Any] = []
+
+        if target_id:
+            conditions.append("target_id = ?")
+            params.append(target_id)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        with self._lock:
+            rows = self._conn.execute(query, tuple(params)).fetchall()
+
+        return [
+            {
+                "alert_key": row[0],
+                "target_id": row[1],
+                "scan_id": row[2],
+                "created_at": row[3],
+                "severity": row[4],
+                "title": row[5],
+                "delivery_status": row[6],
+                "delivery_attempts": row[7],
+                "delivery_error": row[8],
+                "delivered_at": row[9],
+            }
+            for row in rows
+        ]
+
+    def retry_alert_event(self, alert_key: str) -> Dict[str, Any]:
+        """Retry delivery for one alert event by key."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT target_id, scan_id, severity, title, payload
+                   FROM alert_events WHERE alert_key = ?""",
+                (alert_key,)
+            ).fetchone()
+
+        if not row:
+            return {
+                "alert_key": alert_key,
+                "status": "not_found",
+                "message": "Alert event not found",
+            }
+
+        target_id, scan_id, severity, title, payload_raw = row
+        try:
+            payload = json.loads(payload_raw) if payload_raw else {}
+        except Exception:
+            payload = {}
+
+        delivery = self._deliver_webhook(payload)
+        self._record_alert_event(
+            alert_key=alert_key,
+            target_id=target_id,
+            scan_id=scan_id,
+            severity=severity,
+            title=title,
+            payload=payload,
+            status=delivery["status"],
+            attempts=delivery["attempts"],
+            last_error=delivery.get("error"),
+            delivered_at=delivery.get("delivered_at"),
+        )
+
+        return {
+            "alert_key": alert_key,
+            "target_id": target_id,
+            "scan_id": scan_id,
+            "delivery_status": delivery["status"],
+            "delivery_attempts": delivery["attempts"],
+            "delivery_error": delivery.get("error"),
+            "delivered_at": delivery.get("delivered_at"),
+        }
+
+    def retry_failed_alerts(self, limit: int = 20) -> Dict[str, Any]:
+        """Retry delivery for failed alert events."""
+        failed = self.list_alert_events(status="failed", limit=limit)
+        retried = [self.retry_alert_event(event["alert_key"]) for event in failed]
+        return {
+            "requested": limit,
+            "failed_found": len(failed),
+            "retried": len(retried),
+            "results": retried,
+        }
+
+    def _deliver_webhook(self, alert_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Deliver one alert payload to webhook with retries."""
+        if not self.alert_webhook_url:
+            return {
+                "status": "disabled",
+                "attempts": 0,
+                "error": "ALERT_WEBHOOK_URL not configured",
+                "delivered_at": None,
+            }
+
+        last_error = None
+        attempts = 0
+        for attempt in range(1, self.alert_webhook_retries + 2):
+            attempts = attempt
+            try:
+                response = requests.post(
+                    self.alert_webhook_url,
+                    json=alert_payload,
+                    timeout=self.alert_webhook_timeout,
+                )
+                if 200 <= response.status_code < 300:
+                    return {
+                        "status": "sent",
+                        "attempts": attempts,
+                        "error": None,
+                        "delivered_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    }
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+            except Exception as exc:
+                last_error = str(exc)
+
+        return {
+            "status": "failed",
+            "attempts": attempts,
+            "error": last_error,
+            "delivered_at": None,
+        }
+
+    def dispatch_alerts(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Dispatch new alerts and persist delivery status; dedupe by alert key."""
+        delivered: List[Dict[str, Any]] = []
+        for alert in alerts:
+            alert_key = alert.get("alert_key")
+            if not alert_key:
+                continue
+
+            existing = self._get_alert_event(alert_key)
+            if existing:
+                merged = dict(alert)
+                merged.update(existing)
+                delivered.append(merged)
+                continue
+
+            payload = {
+                "event": "scan_risk_worsened",
+                "alert": alert,
+            }
+            delivery = self._deliver_webhook(payload)
+            self._record_alert_event(
+                alert_key=alert_key,
+                target_id=alert.get("target_id", ""),
+                scan_id=alert.get("scan_id"),
+                severity=alert.get("severity", "medium"),
+                title=alert.get("title", "Risk worsened"),
+                payload=payload,
+                status=delivery["status"],
+                attempts=delivery["attempts"],
+                last_error=delivery.get("error"),
+                delivered_at=delivery.get("delivered_at"),
+            )
+            merged = dict(alert)
+            merged.update({
+                "delivery_status": delivery["status"],
+                "delivery_attempts": delivery["attempts"],
+                "delivery_error": delivery.get("error"),
+                "delivered_at": delivery.get("delivered_at"),
+            })
+            delivered.append(merged)
+        return delivered
 
     def _target_to_row(self, t: ScanTarget) -> tuple:
         return (
@@ -264,6 +555,87 @@ class ScanScheduler:
             for r in rows
         ]
 
+    def get_scan_alerts(self, target_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Compute change alerts by comparing consecutive successful scans."""
+        history = self.get_scan_history(target_id, limit=max(limit + 1, 2))
+        successful = [h for h in history if h.status == "complete"]
+        alerts: List[Dict[str, Any]] = []
+
+        for idx in range(len(successful) - 1):
+            current = successful[idx]
+            previous = successful[idx + 1]
+
+            critical_delta = current.critical_count - previous.critical_count
+            high_delta = current.high_count - previous.high_count
+            findings_delta = current.findings_count - previous.findings_count
+            current_risk = self._load_risk_level(current)
+            previous_risk = self._load_risk_level(previous)
+            risk_worsened = self._risk_rank(current_risk) > self._risk_rank(previous_risk)
+
+            meaningful_change = (
+                critical_delta > 0
+                or high_delta >= self.alert_high_delta_threshold
+                or risk_worsened
+            )
+
+            if not meaningful_change:
+                continue
+
+            if critical_delta > 0:
+                severity = "critical"
+                title = "Critical findings increased"
+            elif risk_worsened:
+                severity = "high"
+                title = f"Risk level worsened ({previous_risk or 'UNKNOWN'} -> {current_risk or 'UNKNOWN'})"
+            elif high_delta > 0:
+                severity = "high"
+                title = "High-severity findings increased"
+            else:
+                severity = "medium"
+                title = "Total findings increased"
+
+            alert = {
+                "target_id": target_id,
+                "scan_id": current.scan_id,
+                "previous_scan_id": previous.scan_id,
+                "completed_at": current.completed_at,
+                "severity": severity,
+                "title": title,
+                "delta": {
+                    "critical": critical_delta,
+                    "high": high_delta,
+                    "findings": findings_delta,
+                },
+                "current": {
+                    "critical": current.critical_count,
+                    "high": current.high_count,
+                    "findings": current.findings_count,
+                },
+                "previous": {
+                    "critical": previous.critical_count,
+                    "high": previous.high_count,
+                    "findings": previous.findings_count,
+                },
+                "risk_transition": f"{previous_risk or 'UNKNOWN'}->{current_risk or 'UNKNOWN'}",
+            }
+            alert["alert_key"] = self._make_alert_key(target_id, alert)
+            existing = self._get_alert_event(alert["alert_key"])
+            if existing:
+                alert.update(existing)
+            else:
+                alert.update({
+                    "delivery_status": "pending",
+                    "delivery_attempts": 0,
+                    "delivery_error": None,
+                    "delivered_at": None,
+                })
+            alerts.append(alert)
+
+            if len(alerts) >= limit:
+                break
+
+        return alerts
+
     # ------------------------------------------------------------------
     # SCAN LOOP
     # ------------------------------------------------------------------
@@ -315,6 +687,10 @@ class ScanScheduler:
                     commit_hash=result.repo.commit_hash,
                     result_path=result_file
                 )
+                alerts = self.dispatch_alerts(self.get_scan_alerts(target.id, limit=1))
+                result_dict["scan_id"] = scan_id
+                result_dict["results_dir"] = self.results_dir
+                result_dict["alerts"] = alerts
                 return result_dict
 
             elif target.target_type == "address":
@@ -346,6 +722,10 @@ class ScanScheduler:
                     critical_count=critical, high_count=high,
                     result_path=result_file
                 )
+                alerts = self.dispatch_alerts(self.get_scan_alerts(target.id, limit=1))
+                result_dict["scan_id"] = scan_id
+                result_dict["results_dir"] = self.results_dir
+                result_dict["alerts"] = alerts
                 return result_dict
 
             else:

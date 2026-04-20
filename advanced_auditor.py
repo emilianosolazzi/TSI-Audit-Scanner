@@ -29,7 +29,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple, Set
 from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
-from collections import defaultdict
+from collections import defaultdict, Counter
 from functools import lru_cache
 
 try:
@@ -1125,6 +1125,7 @@ class AuditReport:
     external_functions: int
     payable_functions: int
     admin_functions: int
+    rating_breakdown: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1142,7 +1143,8 @@ class AuditReport:
             },
             "scores": {
                 "security_score": self.security_score,
-                "risk_level": self.risk_level
+                "risk_level": self.risk_level,
+                "rating_breakdown": self.rating_breakdown
             },
             "summary": {
                 "total_findings": len(self.findings),
@@ -3687,7 +3689,11 @@ class AdvancedAuditor:
         findings = self._filter_findings(findings, metadata.name)
         
         # Calculate scores
-        security_score, risk_level = self._calculate_scores(findings)
+        security_score, risk_level, rating_breakdown = self._calculate_scores(
+            findings,
+            metadata.name,
+            abi_summary.get("protocols", []),
+        )
         
         duration_ms = (time.time() - start_time) * 1000
         
@@ -3698,6 +3704,7 @@ class AdvancedAuditor:
             duration_ms=duration_ms,
             security_score=security_score,
             risk_level=risk_level,
+            rating_breakdown=rating_breakdown,
             interfaces_detected=abi_summary.get("interfaces", []),
             defi_protocols=abi_summary.get("protocols", []),
             access_control_pattern=abi_summary.get("access_control"),
@@ -3712,15 +3719,19 @@ class AdvancedAuditor:
         """Filter findings by confidence and remove duplicates."""
         # Filter by minimum confidence
         filtered = [f for f in findings if f.confidence >= self.MIN_CONFIDENCE]
+        info_min_confidence = max(self.MIN_CONFIDENCE, 0.65)
+        filtered = [f for f in filtered if not (f.severity == Severity.INFO and f.confidence < info_min_confidence)]
         
-        # Remove duplicates (same ID + same line number)
-        seen = set()
-        unique = []
+        # Remove duplicates with a richer key and keep the strongest signal.
+        best_by_key: Dict[Tuple[Any, ...], Finding] = {}
         for f in filtered:
-            key = (f.id, f.line_number)
-            if key not in seen:
-                seen.add(key)
-                unique.append(f)
+            context = (f.function_name or "").strip().lower() or (f.location or "").strip().lower()
+            key = (f.id, f.line_number, context, (f.title or "").strip().lower())
+            existing = best_by_key.get(key)
+            if existing is None or f.confidence > existing.confidence:
+                best_by_key[key] = f
+
+        unique = list(best_by_key.values())
         
         # For known safe contracts (major protocols), downgrade some findings
         if contract_name:
@@ -3732,7 +3743,17 @@ class AdvancedAuditor:
                     # Downgrade informational findings for known protocols
                     if f.id in ["DEFI-001", "DEFI-002"]:
                         f.confidence = min(f.confidence, 0.5)
-        
+
+        severity_rank = {
+            Severity.CRITICAL: 0,
+            Severity.HIGH: 1,
+            Severity.MEDIUM: 2,
+            Severity.LOW: 3,
+            Severity.GAS: 4,
+            Severity.INFO: 5,
+        }
+        unique.sort(key=lambda f: (severity_rank.get(f.severity, 99), -f.confidence, f.line_number or 10**9))
+
         return unique
     
     def _resolve_proxy_implementation(self, address: str) -> Optional[str]:
@@ -4007,35 +4028,120 @@ class AdvancedAuditor:
         
         return raw_source
     
-    def _calculate_scores(self, findings: List[Finding]) -> Tuple[float, str]:
-        """Calculate security score and risk level."""
+    def _calculate_scores(
+        self,
+        findings: List[Finding],
+        contract_name: Optional[str] = None,
+        protocols: Optional[List[str]] = None,
+    ) -> Tuple[float, str, Dict[str, Any]]:
+        """Calculate security score, risk level, and transparent rating breakdown."""
         if not findings:
-            return 100.0, "SAFE"
-        
-        # Weight by severity
-        total_weight = sum(f.severity.weight * f.confidence for f in findings)
+            return 100.0, "SAFE", {
+                "findings_count": 0,
+                "weighted_penalty": 0.0,
+                "severity_impact": {},
+            }
+
+        protocols = protocols or []
+        name = (contract_name or "").lower()
+        infra_markers = ["router", "factory", "pair", "pool", "library", "helper"]
+        is_infra_profile = any(marker in name for marker in infra_markers) or any(
+            p in {"uniswap_v2", "uniswap_v3", "uniswap_v4", "curve", "balancer_v2"}
+            for p in protocols
+        )
+
+        discounted_ids_for_infra = {
+            "DEFI-001", "DEFI-002", "DEFI-004", "ACCESS-002", "PROXY-002", "INIT-004"
+        }
+
+        finding_count = len(findings)
+        id_counts = Counter(f.id for f in findings)
+        id_confidence_sums = defaultdict(float)
+        for f in findings:
+            id_confidence_sums[f.id] += f.confidence
+
+        severity_impact = defaultdict(float)
+        adjusted_severity_impact = defaultdict(float)
+        calibration_by_id: Dict[str, float] = {}
+        for f in findings:
+            base_impact = f.severity.weight * f.confidence
+            severity_impact[f.severity.name] += base_impact
+
+            profile_multiplier = 1.0
+            if is_infra_profile and f.id in discounted_ids_for_infra:
+                profile_multiplier = 0.4
+            elif is_infra_profile and f.severity in {Severity.INFO, Severity.GAS}:
+                profile_multiplier = 0.8
+
+            # Data-driven prevalence calibration from current finding distribution.
+            # Repeated low/medium informational IDs should not dominate aggregate score.
+            prevalence = id_counts[f.id] / max(1, finding_count)
+            prevalence_multiplier = 1.0 - min(0.35, max(0.0, prevalence - 0.12))
+
+            avg_id_confidence = id_confidence_sums[f.id] / max(1, id_counts[f.id])
+            confidence_multiplier = 1.0
+            if f.severity in {Severity.INFO, Severity.GAS, Severity.LOW, Severity.MEDIUM} and avg_id_confidence < 0.72:
+                confidence_multiplier = 0.9
+
+            multiplier = profile_multiplier * prevalence_multiplier * confidence_multiplier
+
+            # Keep severe findings impactful even with prevalence/profile adjustments.
+            if f.severity in {Severity.CRITICAL, Severity.HIGH}:
+                multiplier = max(multiplier, 0.85)
+
+            prev_multiplier = calibration_by_id.get(f.id, 0.0)
+            calibration_by_id[f.id] = max(prev_multiplier, round(multiplier, 3))
+
+            adjusted_severity_impact[f.severity.name] += base_impact * multiplier
+
+        total_weighted_penalty = sum(adjusted_severity_impact.values())
         max_weight = len(findings) * Severity.CRITICAL.weight
-        
+
         # Inverse score (higher = safer)
-        security_score = max(0, 100 - (total_weight / max_weight * 100))
+        security_score = max(0, 100 - (total_weighted_penalty / max_weight * 100))
         security_score = round(security_score, 1)
-        
+
         # Determine risk level
         critical_count = sum(1 for f in findings if f.severity == Severity.CRITICAL)
         high_count = sum(1 for f in findings if f.severity == Severity.HIGH)
+        severe_weighted_count = sum(
+            1.0 if f.severity == Severity.CRITICAL else 0.6
+            for f in findings
+            if f.severity in {Severity.CRITICAL, Severity.HIGH} and f.confidence >= 0.75
+        )
         
         if critical_count > 0:
             risk_level = "CRITICAL"
-        elif high_count > 2:
+        elif high_count > 2 or severe_weighted_count >= 2.2:
             risk_level = "HIGH"
-        elif high_count > 0 or security_score < 70:
+        elif high_count > 0 or security_score < (62 if is_infra_profile else 70):
             risk_level = "MEDIUM"
         elif security_score < 90:
             risk_level = "LOW"
         else:
             risk_level = "SAFE"
-        
-        return security_score, risk_level
+
+        rating_breakdown = {
+            "findings_count": len(findings),
+            "contract_profile": "INFRA_LIKE" if is_infra_profile else "STANDARD",
+            "weighted_penalty": round(total_weighted_penalty, 2),
+            "max_possible_penalty": max_weight,
+            "severity_impact": {
+                severity: round(impact, 2)
+                for severity, impact in sorted(severity_impact.items(), key=lambda item: item[0])
+            },
+            "adjusted_severity_impact": {
+                severity: round(impact, 2)
+                for severity, impact in sorted(adjusted_severity_impact.items(), key=lambda item: item[0])
+            },
+            "high_confidence_severe_findings": round(severe_weighted_count, 2),
+            "calibration_by_finding_id": {
+                fid: mult
+                for fid, mult in sorted(calibration_by_id.items(), key=lambda item: item[0])
+            },
+        }
+
+        return security_score, risk_level, rating_breakdown
 
 
 # ===================================================

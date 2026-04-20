@@ -114,6 +114,12 @@ class Config:
     # Logging
     log_level: str = "INFO"
     log_file: str = "audit_service.log"
+
+    # Alerting
+    alert_webhook_url: str = ""
+    alert_webhook_timeout: float = 5.0
+    alert_webhook_retries: int = 2
+    alert_high_delta_threshold: int = 1
     
     @classmethod
     def from_env(cls) -> "Config":
@@ -130,7 +136,11 @@ class Config:
             jwt_expiry_hours=int(os.getenv("JWT_EXPIRY_HOURS", "24")),
             cache_ttl_seconds=int(os.getenv("CACHE_TTL", "3600")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            log_file=os.getenv("LOG_FILE", "audit_service.log")
+            log_file=os.getenv("LOG_FILE", "audit_service.log"),
+            alert_webhook_url=os.getenv("ALERT_WEBHOOK_URL", ""),
+            alert_webhook_timeout=float(os.getenv("ALERT_WEBHOOK_TIMEOUT", "5")),
+            alert_webhook_retries=int(os.getenv("ALERT_WEBHOOK_RETRIES", "2")),
+            alert_high_delta_threshold=int(os.getenv("ALERT_HIGH_DELTA_THRESHOLD", "1"))
         )
 
 

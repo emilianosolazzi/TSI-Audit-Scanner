@@ -114,6 +114,7 @@ docker compose up -d
 | `GET` | `/chains` | Supported chains (ethereum, arbitrum, polygon, bsc, optimism, base, avalanche) |
 | `GET` | `/pricing` | Tier information |
 | `GET` | `/usage` | Current rate limit usage |
+| `GET` | `/triage/<address>?chain=ethereum` | Fast plain-English risk triage with capability flags (mintable, pausable, blacklist, upgradeable, ownership) |
 | `GET` | `/audit/<address>?chain=ethereum&full=false` | Audit on-chain contract |
 | `POST` | `/audit/batch` | Batch audit (enterprise) |
 | `POST` | `/compare` | Compare two contracts |
@@ -135,10 +136,31 @@ docker compose up -d
 | `DELETE` | `/targets/<id>` | Remove target |
 | `POST` | `/targets/<id>/scan` | Trigger immediate scan |
 | `GET` | `/targets/<id>/history` | Scan history |
+| `GET` | `/alerts?target_id=<id>&status=failed&limit=50` | List alert delivery events |
+| `POST` | `/alerts/<alert_key>/retry` | Retry one alert delivery |
+| `POST` | `/alerts/retry-failed` | Retry failed alert deliveries in batch |
+
+Scheduler responses now include `alerts` when risk worsens between scans (e.g., critical/high findings increase).
+
+```bash
+# List failed alerts
+curl "http://localhost:8080/alerts?status=failed&limit=20"
+
+# Retry one failed alert
+curl -X POST http://localhost:8080/alerts/<alert_key>/retry
+
+# Retry failed alerts in batch
+curl -X POST http://localhost:8080/alerts/retry-failed \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 20}'
+```
 
 ### Examples
 
 ```bash
+# Fast triage for a token/contract before deeper review
+curl http://localhost:8080/triage/0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984?chain=ethereum
+
 # Audit an on-chain contract with consistency analysis
 curl http://localhost:8080/audit/0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984?chain=ethereum
 
@@ -152,6 +174,19 @@ curl -X POST http://localhost:8080/targets \
   -H "Content-Type: application/json" \
   -d '{"url": "https://github.com/owner/repo", "interval_hours": 24}'
 ```
+
+`/triage` response includes UI-ready fields:
+- `summary_labels`: short chips like `Risk:HIGH`, `Upgradeable`, `Mintable`
+- `risk_badges`: structured badges with `label`, `severity`, and `reason`
+- `flags`: capability booleans (`mintable`, `pausable`, `blacklist_capability`, `owner_controlled`, `upgradeable`, etc.)
+
+`/audit` score output includes `scores.rating_breakdown` for explainability:
+- `contract_profile`: `STANDARD` or `INFRA_LIKE` (router/factory/pair/pool-style contracts)
+- `weighted_penalty`: adjusted penalty used to derive `security_score`
+- `severity_impact`: raw impact per severity bucket
+- `adjusted_severity_impact`: profile-adjusted impact per severity bucket
+- `high_confidence_severe_findings`: weighted signal from high-confidence `HIGH/CRITICAL` findings
+- `calibration_by_finding_id`: per-ID multiplier after prevalence/confidence calibration
 
 ## CLI
 
@@ -243,6 +278,19 @@ All settings via environment variables (see `.env.example`):
 | `SCANNER_WORKSPACE` | `./scanner_workspace` | Clone directory |
 | `SCANNER_DB` | `scan_history.db` | SQLite path |
 | `LOG_LEVEL` | INFO | Logging verbosity |
+| `ALERT_WEBHOOK_URL` | — | Optional webhook endpoint for risk-worsening alerts |
+| `ALERT_WEBHOOK_TIMEOUT` | `5` | Webhook request timeout (seconds) |
+| `ALERT_WEBHOOK_RETRIES` | `2` | Retries after first webhook attempt |
+| `ALERT_HIGH_DELTA_THRESHOLD` | `1` | Minimum increase in high findings to trigger alerts |
+
+### Risk-Worsening Alert Behavior
+
+Scheduler alerting triggers only on meaningful worsening:
+- Critical findings increase (`critical_delta > 0`)
+- High findings increase beyond threshold (`high_delta >= ALERT_HIGH_DELTA_THRESHOLD`)
+- Risk level worsens (`LOW -> MEDIUM`, `MEDIUM -> HIGH`, etc.) when available
+
+Alert delivery is deduplicated by target + delta/risk transition hash, retried with timeout controls, and persisted with delivery status (`pending`, `sent`, `failed`, `disabled`).
 
 ## Requirements
 

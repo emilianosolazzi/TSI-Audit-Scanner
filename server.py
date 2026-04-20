@@ -12,7 +12,7 @@ import re
 import logging
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
 # Flask
 try:
@@ -82,6 +82,206 @@ def validate_local_path(path: str) -> bool:
         os.environ.get("SCANNER_WORKSPACE", os.path.join(os.getcwd(), "scanner_workspace"))
     )
     return real == allowed_base or real.startswith(allowed_base + os.sep)
+
+
+def _severity_rank(severity: str) -> int:
+    return {
+        "CRITICAL": 5,
+        "HIGH": 4,
+        "MEDIUM": 3,
+        "LOW": 2,
+        "GAS": 1,
+        "INFO": 0,
+    }.get(severity, 0)
+
+
+def _extract_abi_function_names(abi: Optional[List[Dict[str, Any]]]) -> set:
+    """Return normalized ABI function names."""
+    if not abi:
+        return set()
+    return {
+        item.get("name", "")
+        for item in abi
+        if item.get("type") == "function" and item.get("name")
+    }
+
+
+def _matches_any_prefix(function_names: set, prefixes: List[str]) -> bool:
+    return any(
+        any(name.lower().startswith(prefix) for prefix in prefixes)
+        for name in function_names
+    )
+
+
+def _build_capability_flags(report, abi: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Build user-facing capability flags from ABI and audit metadata."""
+    function_names = _extract_abi_function_names(abi)
+    lowered = {name.lower() for name in function_names}
+    access_control = report.access_control_pattern or "Unknown"
+
+    mintable = (
+        "mint" in lowered or
+        _matches_any_prefix(function_names, ["mint", "issue", "allocate"])
+    )
+    pausable = any(name in lowered for name in {"pause", "unpause", "paused"})
+    blacklist_capability = any(
+        token in name
+        for name in lowered
+        for token in ["blacklist", "blocklist", "freeze", "frozen", "ban"]
+    )
+    owner_controlled = access_control in {"Ownable", "Ownable2Step"} or "owner" in lowered
+    role_controlled = access_control == "AccessControl (OZ)" or {"grantrole", "revokerole", "hasrole"} <= lowered
+    upgradeable = bool(report.metadata.proxy or report.metadata.implementation) or any(
+        name in lowered for name in {"upgradeto", "upgradetoandcall", "implementation"}
+    )
+
+    return {
+        "mintable": mintable,
+        "pausable": pausable,
+        "blacklist_capability": blacklist_capability,
+        "owner_controlled": owner_controlled,
+        "role_controlled": role_controlled,
+        "upgradeable": upgradeable,
+        "ownership_transferable": any(name in lowered for name in {"transferownership", "renounceownership", "acceptownership"}),
+        "role_management_surface": any(name in lowered for name in {"grantrole", "revokerole", "renouncerole"}),
+    }
+
+
+def _build_summary_labels(flags: Dict[str, Any], risk_level: str) -> List[str]:
+    """Build short UI labels for quick scan cards/tables."""
+    labels: List[str] = [f"Risk:{risk_level}"]
+
+    if flags.get("unverified_contract"):
+        labels.append("Unverified")
+    if flags.get("upgradeable"):
+        labels.append("Upgradeable")
+    if flags.get("owner_controlled"):
+        labels.append("OwnerControlled")
+    if flags.get("role_controlled"):
+        labels.append("RoleControlled")
+    if flags.get("mintable"):
+        labels.append("Mintable")
+    if flags.get("pausable"):
+        labels.append("Pausable")
+    if flags.get("blacklist_capability"):
+        labels.append("BlacklistCapable")
+    if flags.get("admin_surface_present"):
+        labels.append("AdminSurface")
+
+    return labels
+
+
+def _build_risk_badges(flags: Dict[str, Any], risk_level: str) -> List[Dict[str, str]]:
+    """Build richer badge objects for frontend rendering."""
+    severity_map = {
+        "CRITICAL": "critical",
+        "HIGH": "high",
+        "MEDIUM": "medium",
+        "LOW": "low",
+        "SAFE": "info",
+    }
+    badges: List[Dict[str, str]] = [{
+        "label": f"Risk {risk_level}",
+        "severity": severity_map.get(risk_level, "info"),
+        "reason": "Overall quick-scan risk level",
+    }]
+
+    badge_rules = [
+        ("unverified_contract", "Unverified Source", "high", "Source not verified on explorer"),
+        ("upgradeable", "Upgradeable", "medium", "Proxy/upgrade path detected"),
+        ("owner_controlled", "Owner Controlled", "medium", "Privileged owner control surface"),
+        ("role_controlled", "Role Controlled", "low", "Role-based privileged controls"),
+        ("mintable", "Mintable", "medium", "Token supply expansion capability"),
+        ("pausable", "Pausable", "low", "Transfer/function pause capability"),
+        ("blacklist_capability", "Blacklist Capability", "high", "Address blocking/freeze semantics present"),
+    ]
+
+    for key, label, severity, reason in badge_rules:
+        if flags.get(key):
+            badges.append({"label": label, "severity": severity, "reason": reason})
+
+    return badges
+
+
+def _build_triage_response(report, abi: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Build a fast, plain-English contract triage view from a full audit report."""
+    report_data = report.to_dict()
+    contract = report_data["contract"]
+    scores = report_data["scores"]
+    summary = report_data["summary"]
+    analysis = report_data["analysis"]
+    findings = sorted(
+        report_data["findings"],
+        key=lambda finding: (-_severity_rank(finding.get("severity", "INFO")), -finding.get("confidence", 0)),
+    )
+
+    prominent_warnings: List[Dict[str, Any]] = []
+    for finding in findings:
+        if finding.get("severity") not in {"CRITICAL", "HIGH", "MEDIUM"}:
+            continue
+        prominent_warnings.append({
+            "id": finding.get("id"),
+            "severity": finding.get("severity"),
+            "title": finding.get("title"),
+            "category": finding.get("category"),
+            "why_it_matters": finding.get("description"),
+            "recommendation": finding.get("recommendation"),
+        })
+        if len(prominent_warnings) >= 5:
+            break
+
+    flags = {
+        "verified_source": contract.get("verified", False),
+        "proxy_contract": contract.get("proxy", False),
+        "implementation_address": contract.get("implementation"),
+        "token_standard": analysis.get("interfaces", []),
+        "detected_protocols": analysis.get("defi_protocols", []),
+        "access_control_model": analysis.get("access_control") or "Unknown",
+        "admin_surface_present": analysis.get("functions", {}).get("admin", 0) > 0,
+        "payable_surface_present": analysis.get("functions", {}).get("payable", 0) > 0,
+        "unverified_contract": not contract.get("verified", False),
+    }
+    flags.update(_build_capability_flags(report, abi))
+    summary_labels = _build_summary_labels(flags, scores["risk_level"])
+    risk_badges = _build_risk_badges(flags, scores["risk_level"])
+
+    if scores["risk_level"] == "CRITICAL":
+        verdict = "Avoid interacting until the critical issues are reviewed."
+    elif scores["risk_level"] == "HIGH":
+        verdict = "High-risk contract. Manual review is required before use or integration."
+    elif flags.get("unverified_contract") and (flags.get("upgradeable") or flags.get("owner_controlled")):
+        verdict = "Caution: this contract is unverified and has privileged control/upgrade surface. Review thoroughly before interacting."
+    elif scores["risk_level"] == "MEDIUM":
+        verdict = "Use caution. The contract shows meaningful risk signals that need review."
+    elif not contract.get("verified", False):
+        verdict = "Source is not verified, which limits confidence in the scan and increases due-diligence risk."
+    else:
+        verdict = "No severe risk signal was detected in the quick scan, but this is not a substitute for a full audit."
+
+    return {
+        "timestamp": report_data["timestamp"],
+        "contract": contract,
+        "quick_verdict": verdict,
+        "risk": {
+            "security_score": scores["security_score"],
+            "risk_level": scores["risk_level"],
+            "total_findings": summary["total_findings"],
+            "critical": summary["critical"],
+            "high": summary["high"],
+            "medium": summary["medium"],
+        },
+        "summary_labels": summary_labels,
+        "risk_badges": risk_badges,
+        "flags": flags,
+        "surface": {
+            "total_functions": analysis.get("functions", {}).get("total", 0),
+            "external_functions": analysis.get("functions", {}).get("external", 0),
+            "payable_functions": analysis.get("functions", {}).get("payable", 0),
+            "admin_functions": analysis.get("functions", {}).get("admin", 0),
+        },
+        "prominent_warnings": prominent_warnings,
+        "next_step": "Run the full /audit endpoint for detailed findings, code snippets, and export formats."
+    }
 
 
 # ===================================================
@@ -317,6 +517,37 @@ def audit_contract(address: str):
     except Exception as e:
         logger.exception(f"Audit failed for {address}")
         return jsonify({"error": "Audit failed", "message": str(e)}), 500
+
+
+@app.route("/triage/<address>", methods=["GET"])
+@require_feature("basic_audit")
+def triage_contract(address: str):
+    """Fast, plain-English triage for a contract address."""
+    chain = request.args.get("chain", "ethereum")
+
+    if not validate_address(address):
+        return jsonify({
+            "error": "Invalid address",
+            "message": "Must be a valid Ethereum address (0x + 40 hex chars)"
+        }), 400
+
+    if chain not in SUPPORTED_CHAINS:
+        return jsonify({
+            "error": "Invalid chain",
+            "message": f"Supported chains: {list(SUPPORTED_CHAINS.keys())}"
+        }), 400
+
+    try:
+        auditor = AdvancedAuditor(config.etherscan_api_key, chain)
+        report = auditor.audit(address)
+        triage_address = report.metadata.implementation or address.lower()
+        abi = auditor.client.get_contract_abi(triage_address)
+        return jsonify(_build_triage_response(report, abi))
+    except ValueError as e:
+        return jsonify({"error": "Invalid input", "message": str(e)}), 400
+    except Exception as e:
+        logger.exception(f"Triage failed for {address}")
+        return jsonify({"error": "Triage failed", "message": str(e)}), 500
 
 
 @app.route("/audit/url", methods=["GET", "POST"])
@@ -671,6 +902,7 @@ def scan_history(target_id: str):
     """Get scan history for a target."""
     limit = request.args.get("limit", 10, type=int)
     history = scheduler.get_scan_history(target_id, limit=limit)
+    alerts = scheduler.get_scan_alerts(target_id, limit=limit)
     return jsonify({
         "target_id": target_id,
         "scans": [
@@ -685,7 +917,8 @@ def scan_history(target_id: str):
                 "commit_hash": h.commit_hash,
             }
             for h in history
-        ]
+        ],
+        "alerts": alerts,
     })
 
 
@@ -701,6 +934,40 @@ def get_scan_result(scan_id: str):
 
     with open(result_path) as f:
         return jsonify(json.load(f))
+
+
+@app.route("/alerts", methods=["GET"])
+@require_feature("api_access")
+def list_alert_events():
+    """List alert delivery events, optionally filtered by target/status."""
+    target_id = request.args.get("target_id")
+    status = request.args.get("status")
+    limit = request.args.get("limit", 50, type=int)
+    events = scheduler.list_alert_events(target_id=target_id, status=status, limit=limit)
+    return jsonify({
+        "count": len(events),
+        "alerts": events,
+    })
+
+
+@app.route("/alerts/<alert_key>/retry", methods=["POST"])
+@require_feature("api_access")
+def retry_alert_event(alert_key: str):
+    """Retry one alert webhook delivery by alert key."""
+    result = scheduler.retry_alert_event(alert_key)
+    if result.get("status") == "not_found":
+        return jsonify(result), 404
+    return jsonify(result)
+
+
+@app.route("/alerts/retry-failed", methods=["POST"])
+@require_feature("api_access")
+def retry_failed_alerts():
+    """Retry failed alert deliveries in batch."""
+    data = request.get_json(silent=True) or {}
+    limit = int(data.get("limit", 20))
+    result = scheduler.retry_failed_alerts(limit=limit)
+    return jsonify(result)
 
 
 # ===================================================
