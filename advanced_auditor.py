@@ -32,6 +32,10 @@ from enum import Enum, auto
 from collections import defaultdict, Counter
 from functools import lru_cache
 
+from env_loader import load_local_env_files
+
+load_local_env_files()
+
 try:
     import requests
 except ImportError:

@@ -24,6 +24,10 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
 
+from env_loader import load_local_env_files
+
+load_local_env_files()
+
 # Windows consoles default to cp1252 which can't encode the unicode box-drawing
 # characters used in the summary printer.  Reconfigure to UTF-8 if possible.
 try:

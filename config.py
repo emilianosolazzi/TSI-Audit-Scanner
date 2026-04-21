@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 from enum import Enum
 
+from env_loader import load_local_env_files
+
+load_local_env_files()
+
 
 class Environment(Enum):
     DEVELOPMENT = "development"

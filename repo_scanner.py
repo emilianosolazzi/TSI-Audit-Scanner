@@ -207,10 +207,18 @@ class RepoScanner:
                         findings = self._analyze_vyper_source(source, source_file)
                     else:
                         findings = self._analyze_source(source, source_file)
+                        # Per-file novel passes: guard-dominance and precompile crypto.
+                        findings.extend(self._analyze_novel_per_file(source, source_file))
                     all_findings.extend(findings)
                     result.files_scanned += 1
                 except Exception as e:
                     result.errors.append(f"{source_file.path}: {e}")
+
+            # 4b. Project-wide novel pass: selector / storage-slot collisions.
+            try:
+                all_findings.extend(self._analyze_novel_project_wide(file_sources, local_path))
+            except Exception as exc:
+                logger.warning("Project-wide novel pass failed: %s", exc)
 
             result.repo.total_lines = total_lines
             result.findings = all_findings
@@ -508,6 +516,81 @@ class RepoScanner:
         m = re.search(r"pragma\s+solidity\s+([^;]+);", source)
         return m.group(1).strip() if m else None
 
+    @staticmethod
+    def _pragma_satisfies_ge(pragma: str, threshold: str) -> bool:
+        """
+        Return True when every version admitted by ``pragma`` is >= threshold.
+
+        Handles caret/tilde prefixes, ``>=`` clauses, and multi-part ranges.
+        Intended for version-gated filters such as ``SWC-101`` being noise on
+        Solidity 0.8+ where checked arithmetic is the default.
+        """
+        def _tuple(v: str):
+            parts = re.findall(r"\d+", v)
+            return tuple(int(p) for p in parts[:3]) if parts else (0,)
+
+        th = _tuple(threshold)
+        # Lower-bound extraction: caret/tilde/>= all pin a minimum.
+        cleaned = pragma.replace(" ", "")
+        # Extract the first explicit version literal from the pragma.
+        versions = re.findall(r"\d+(?:\.\d+){0,2}", cleaned)
+        if not versions:
+            return False
+        lower = _tuple(versions[0])
+        return lower >= th
+
+    # Regexes used by the precision-filter stage.
+    _FP_TIMESTAMP_DOWNCAST_RE = re.compile(
+        r"uint(?:64|96|128|160|192|224|256)\s*\(\s*"
+        r"(?:block\.(?:timestamp|number)|now)\s*\)"
+    )
+    _FP_EMPTY_RECEIVE_RE = re.compile(
+        r"(?:receive|fallback)\s*\(\s*\)\s*"
+        r"external\s+payable\s*\{\s*\}"
+    )
+
+    @classmethod
+    def _is_known_false_positive(
+        cls, vuln_id: str, line: str, lines: List[str], line_no: int,
+    ) -> bool:
+        """
+        Drop well-known pattern-engine false positives.
+
+        Precision-only filters.  Each branch encodes an invariant under
+        which the generic regex is guaranteed to misfire; ambiguous cases
+        fall through and remain in the report.
+        """
+        # TOKEN-007: uint64(block.timestamp) is safe for ~584B years.
+        if vuln_id == "TOKEN-007" and cls._FP_TIMESTAMP_DOWNCAST_RE.search(line):
+            return True
+
+        # ADVANCED-002: empty receive()/fallback() with no body has no
+        # state effect and no auth surface.
+        if vuln_id == "ADVANCED-002":
+            window = " ".join(
+                lines[max(0, line_no - 2): min(len(lines), line_no + 2)]
+            )
+            if cls._FP_EMPTY_RECEIVE_RE.search(window):
+                return True
+
+        # ADV-UNBOUNDED-LOOP-001: line attribution bug.  If the flagged
+        # line itself is a comment/import/pragma/blank (not code), the
+        # detector has mis-located the match.
+        if vuln_id == "ADV-UNBOUNDED-LOOP-001":
+            stripped = line.strip()
+            if (
+                not stripped
+                or stripped.startswith("//")
+                or stripped.startswith("/*")
+                or stripped.startswith("*")
+                or stripped.startswith("import")
+                or stripped.startswith("pragma")
+                or stripped.startswith("using ")
+            ):
+                return True
+
+        return False
+
     def _extract_contract_names(self, source: str) -> List[str]:
         return re.findall(
             r"(?:contract|interface|library|abstract\s+contract)\s+(\w+)", source
@@ -546,6 +629,12 @@ class RepoScanner:
             Severity, Finding
         )
 
+        # Populate pragma_version on demand so version-gated rules
+        # (e.g. SWC-101 on Solidity <0.8.0) filter correctly even when
+        # callers construct SolidityFile directly.
+        if not sol_file.pragma_version:
+            sol_file.pragma_version = self._extract_pragma(source)
+
         findings = []
         lines = source.split("\n")
 
@@ -581,7 +670,9 @@ class RepoScanner:
             # Solidity version check
             ver_check = vuln.get("solidity_version_check")
             if ver_check and sol_file.pragma_version:
-                if ver_check.startswith("<") and sol_file.pragma_version >= ver_check[1:]:
+                if ver_check.startswith("<") and self._pragma_satisfies_ge(
+                    sol_file.pragma_version, ver_check[1:]
+                ):
                     continue
 
             # Find matches
@@ -597,6 +688,11 @@ class RepoScanner:
                     if info_for and sol_file.contract_names:
                         if any(t in n for n in sol_file.contract_names for t in info_for):
                             continue
+
+                    # Precision filters — drop well-known pattern-engine FPs
+                    # before they pollute the report.
+                    if self._is_known_false_positive(vuln_id, line, lines, i):
+                        continue
 
                     # Get code snippet (3 lines of context)
                     start = max(0, i - 2)
@@ -625,6 +721,95 @@ class RepoScanner:
 
         analyzer = SourceAnalyzer()
         return analyzer.analyze_vyper_source(source, source_file.path)
+
+    # ------------------------------------------------------------------
+    # NOVEL ANALYZERS (CFG/guard-dominance + precompile crypto + selector
+    # / storage-slot collision).  Integrated into the pipeline rather
+    # than run as a separate tool.
+    # ------------------------------------------------------------------
+
+    def _analyze_novel_per_file(
+        self, source: str, sol_file: SolidityFile,
+    ) -> List[Dict]:
+        """Per-file novel passes (guard-dominance + precompile crypto)."""
+        findings: List[Dict] = []
+        try:
+            from novel_analyzers import (
+                GuardDominanceAnalyzer,
+                PrecompileCryptoAnalyzer,
+                MerkleProofVerifierAnalyzer,
+            )
+        except Exception as exc:
+            logger.debug("novel_analyzers unavailable: %s", exc)
+            return findings
+        try:
+            findings.extend(
+                GuardDominanceAnalyzer(source, sol_file.path).analyze()
+            )
+        except Exception as exc:
+            logger.debug("GuardDominanceAnalyzer failed on %s: %s", sol_file.path, exc)
+        try:
+            findings.extend(
+                PrecompileCryptoAnalyzer(source, sol_file.path).analyze()
+            )
+        except Exception as exc:
+            logger.debug("PrecompileCryptoAnalyzer failed on %s: %s", sol_file.path, exc)
+        try:
+            findings.extend(
+                MerkleProofVerifierAnalyzer(source, sol_file.path).analyze()
+            )
+        except Exception as exc:
+            logger.debug("MerkleProofVerifierAnalyzer failed on %s: %s", sol_file.path, exc)
+        # Black-hat-oriented adversarial pass (lazy import).
+        try:
+            from adversarial_analyzers import AdversarialAnalyzer
+            findings.extend(
+                AdversarialAnalyzer(source, sol_file.path).analyze()
+            )
+        except Exception as exc:
+            logger.debug("AdversarialAnalyzer failed on %s: %s", sol_file.path, exc)
+
+        # Apply precision FP filters to novel/adversarial findings too.
+        lines = source.split("\n")
+        filtered: List[Dict] = []
+        for f in findings:
+            vid = f.get("id") or f.get("vulnerability_id") or ""
+            ln = f.get("line_number") or f.get("line") or 0
+            line_text = lines[ln - 1] if 0 < ln <= len(lines) else ""
+            if self._is_known_false_positive(vid, line_text, lines, ln):
+                continue
+            filtered.append(f)
+        return filtered
+
+    def _analyze_novel_project_wide(
+        self, file_sources: Dict[str, str], repo_dir: str,
+    ) -> List[Dict]:
+        """Project-wide novel pass: selector + storage-slot collisions.
+
+        Tries to reuse compiled artifacts from `forge build` when a
+        Foundry project is present, and falls back to pure-source
+        inspection when no artifacts can be produced.
+        """
+        compiled: Dict[str, Dict] = {}
+        try:
+            from source_analyzer import SourceAnalyzer
+            sa = SourceAnalyzer()
+            if sa.has_forge and os.path.isdir(os.path.join(repo_dir, "out")):
+                # Reuse existing out/ directory if present (don't re-build,
+                # which can be slow and may fail on downstream tests).
+                compiled = sa._parse_forge_artifacts(os.path.join(repo_dir, "out"))
+        except Exception as exc:
+            logger.debug("forge artifact load failed: %s", exc)
+
+        try:
+            from novel_analyzers import StorageSelectorAnalyzer
+            return StorageSelectorAnalyzer(
+                file_sources=file_sources,
+                compiled_contracts=compiled,
+            ).analyze()
+        except Exception as exc:
+            logger.debug("StorageSelectorAnalyzer failed: %s", exc)
+            return []
 
     # ------------------------------------------------------------------
     # SUMMARY

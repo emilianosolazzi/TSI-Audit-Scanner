@@ -148,6 +148,7 @@ class SolcSourceFile:
 # ---------------------------------------------------------------------------
 # Main compilation result
 # ---------------------------------------------------------------------------
+@dataclass
 class CompilationResult:
     """Result of compiling a Solidity project or file."""
     success: bool
