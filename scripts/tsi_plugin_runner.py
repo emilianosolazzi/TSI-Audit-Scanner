@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import re
@@ -182,3 +183,44 @@ def run_tsi_plugin(
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     result["result_path"] = str(result_path)
     return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the Foundry TSI plugin and emit machine-readable results")
+    parser.add_argument("--outdir", default="speed_tests/unified_plugin", help="Output directory")
+    parser.add_argument("--tsi-plugin-dir", default="forge", help="Path to Foundry TSI plugin harness")
+    parser.add_argument("--tsi-fork-url", help="Optional RPC URL for forked TSI execution")
+    parser.add_argument(
+        "--tsi-match-contract",
+        default="TSI_Aave_FlashLoan_Oracle",
+        help="Foundry --match-contract target for TSI plugin",
+    )
+    args = parser.parse_args()
+
+    root_dir = Path(__file__).resolve().parents[1]
+    result = run_tsi_plugin(
+        root_dir=root_dir,
+        outdir=Path(args.outdir),
+        plugin_dir=Path(args.tsi_plugin_dir),
+        fork_url=args.tsi_fork_url,
+        match_contract=args.tsi_match_contract,
+    )
+
+    print(
+        json.dumps(
+            {
+                "status": result.get("status"),
+                "result_json": result.get("result_path"),
+                "findings_json": result.get("findings_path"),
+                "findings_count": result.get("findings_count", 0),
+                "log_path": result.get("log_path"),
+            }
+        )
+    )
+
+    if result.get("status") not in {"pass", "skipped"}:
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()
