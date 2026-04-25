@@ -23,6 +23,7 @@ from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger("RepoScanner")
 
@@ -200,27 +201,55 @@ class RepoScanner:
             # Skip Solidity interfaces by default; they generate declaration-only noise.
             source_files = [f for f in source_files if not f.is_interface]
 
-            # 4. Analyze each file
+            # 4. Analyze each file (parallel I/O + per-file analysis)
             result.status = ScanStatus.ANALYZING
             all_findings = []
             total_lines = 0
             file_sources = {}  # rel_path -> source code
 
-            for source_file in source_files:
-                try:
-                    source = Path(source_file.absolute_path).read_text(encoding="utf-8", errors="replace")
-                    total_lines += source.count("\n") + 1
-                    file_sources[source_file.path] = source
-                    if source_file.language == "vyper":
-                        findings = self._analyze_vyper_source(source, source_file)
-                    else:
-                        findings = self._analyze_source(source, source_file)
-                        # Per-file novel passes: guard-dominance and precompile crypto.
-                        findings.extend(self._analyze_novel_per_file(source, source_file))
-                    all_findings.extend(findings)
-                    result.files_scanned += 1
-                except Exception as e:
-                    result.errors.append(f"{source_file.path}: {e}")
+            # Sort for deterministic ordering even when futures complete out-of-order.
+            ordered_files = sorted(source_files, key=lambda f: f.path)
+
+            def _analyze_one(source_file):
+                source = Path(source_file.absolute_path).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                if source_file.language == "vyper":
+                    findings = self._analyze_vyper_source(source, source_file)
+                else:
+                    findings = self._analyze_source(source, source_file)
+                    findings.extend(self._analyze_novel_per_file(source, source_file))
+                return source_file, source, findings
+
+            # ThreadPoolExecutor: regex is GIL-bound but file I/O + any subprocess
+            # work (solc invocations) release the GIL. Empirically still a 2-3x win.
+            max_workers = min(8, (os.cpu_count() or 2) * 2)
+            results_by_path: Dict[str, Tuple[Any, str, list]] = {}
+            errors_by_path: Dict[str, str] = {}
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_analyze_one, sf): sf for sf in ordered_files}
+                for fut in as_completed(futures):
+                    sf = futures[fut]
+                    try:
+                        source_file, source, findings = fut.result()
+                        results_by_path[source_file.path] = (source_file, source, findings)
+                    except Exception as e:
+                        errors_by_path[sf.path] = f"{sf.path}: {e}"
+
+            # Merge in deterministic (sorted) order.
+            for sf in ordered_files:
+                if sf.path in errors_by_path:
+                    result.errors.append(errors_by_path[sf.path])
+                    continue
+                entry = results_by_path.get(sf.path)
+                if entry is None:
+                    continue
+                _source_file, source, findings = entry
+                total_lines += source.count("\n") + 1
+                file_sources[sf.path] = source
+                all_findings.extend(findings)
+                result.files_scanned += 1
 
             # 4b. Project-wide novel pass: selector / storage-slot collisions.
             try:

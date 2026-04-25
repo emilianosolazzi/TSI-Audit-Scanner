@@ -247,10 +247,18 @@ class CryptoAccessControlAnalyzer:
         r"keccak256\s*\(\s*abi\.encode(?:Packed)?\s*\(",
     )
     _NONCE_USE_RE = re.compile(
-        r"\bnonces?\s*\[[^\]]+\]\s*(?:\+\+|--|\+=|=)|"
-        r"\busedHashes?\s*\[[^\]]+\]\s*=\s*true|"
+        # Any identifier containing 'nonce'/'nonces' (handles bare nonces,
+        # _nonces, userNonces, s_nonce, sigNonces, etc.) being incremented
+        # or written, plus standard usedHashes / isUsed / OZ _useNonce sinks.
+        r"(?:^|[^A-Za-z0-9_])[A-Za-z0-9_]*[Nn]onces?\s*"
+        r"(?:\[[^\]]+\])?\s*(?:\+\+|--|\+=|=(?!=))|"
+        r"(?:^|[^A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*\s*=\s*"
+        r"[A-Za-z0-9_]*[Nn]onces?\s*(?:\[[^\]]+\])?\s*\.add\s*\(|"
+        r"\bused(?:Hashes?|Sigs?|Digests?|Signatures?|Nonces?)\s*"
+        r"\[[^\]]+\]\s*=\s*true|"
         r"\bisUsed\s*\[[^\]]+\]\s*=\s*true|"
-        r"\b_useNonce\s*\(",
+        r"\b_useNonce\s*\(|"
+        r"\b_useCheckedNonce\s*\(",
         re.IGNORECASE,
     )
     # Identity-truncation patterns: bytes20(keccak256(...)),

@@ -32,6 +32,99 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from repo_scanner import RepoScanner, ScanStatus
+from report_generator import generate_markdown_report, generate_sarif_report
+
+
+_SARIF_SEVERITY = {
+    "CRITICAL": "error",
+    "HIGH": "error",
+    "MEDIUM": "warning",
+    "LOW": "note",
+    "GAS": "note",
+    "INFO": "none",
+}
+
+
+def _scan_result_to_report_dict(d: dict, target: str) -> dict:
+    """Adapt a ScanResult.to_dict() payload into the shape that
+    `report_generator` expects (modeled after AdvancedAuditor output)."""
+    findings = d.get("findings", []) or []
+    repo = d.get("repo", {}) or {}
+
+    by_sev: dict[str, int] = {}
+    for f in findings:
+        sev = (f.get("severity") or "INFO").upper()
+        by_sev[sev] = by_sev.get(sev, 0) + 1
+
+    crit = by_sev.get("CRITICAL", 0)
+    high = by_sev.get("HIGH", 0)
+    med = by_sev.get("MEDIUM", 0)
+    low = by_sev.get("LOW", 0)
+    # Crude security score; mirrors AdvancedAuditor weighting roughly.
+    score = max(0, 100 - (crit * 25 + high * 10 + med * 4 + low * 1))
+    if crit:
+        risk = "CRITICAL"
+    elif high:
+        risk = "HIGH"
+    elif med:
+        risk = "MEDIUM"
+    elif low:
+        risk = "LOW"
+    else:
+        risk = "SAFE"
+
+    return {
+        "timestamp": d.get("completed_at") or d.get("started_at"),
+        "duration_ms": float(d.get("duration_seconds", 0)) * 1000.0,
+        "contract": {
+            "address": repo.get("url") or target,
+            "name": Path(target).name or "repo-scan",
+            "chain": "git-repo",
+            "verified": True,
+            "proxy": False,
+        },
+        "scores": {"security_score": score, "risk_level": risk},
+        "summary": {
+            "total_findings": len(findings),
+            "critical": crit,
+            "high": high,
+            "medium": med,
+            "low": low,
+            "info": by_sev.get("INFO", 0),
+            "gas": by_sev.get("GAS", 0),
+        },
+        "analysis": {
+            "interfaces": [],
+            "defi_protocols": [],
+            "access_control": None,
+            "functions": {},
+        },
+        "findings": findings,
+    }
+
+
+def _sarif_with_real_paths(report_dict: dict) -> dict:
+    """generate_sarif_report uses contract.address as the file URI which is
+    fine for on-chain scans but useless for repo scans. Patch each result's
+    artifactLocation to point at the per-finding `file_path` (or `file`)."""
+    sarif = generate_sarif_report(report_dict)
+    findings = report_dict.get("findings", [])
+    runs = sarif.get("runs", [])
+    if not runs:
+        return sarif
+    results = runs[0].get("results", [])
+    for finding, result in zip(findings, results):
+        path = finding.get("file_path") or finding.get("file")
+        if not path:
+            continue
+        line = finding.get("line_number") or 1
+        result["locations"] = [{
+            "physicalLocation": {
+                "artifactLocation": {"uri": str(path).replace("\\", "/")},
+                "region": {"startLine": int(line)},
+            }
+        }]
+    return sarif
 
 
 def _print_section(title: str) -> None:
@@ -92,6 +185,13 @@ def main() -> int:
     parser.add_argument("--forge-match-contract", default="TSI_Findings_Report")
     parser.add_argument("--forge-fork-url", default=None, help="Optional RPC URL for forked TSI execution")
     parser.add_argument("--out", default=None, help="Path to write full result JSON (default scan_results/<id>.json)")
+    parser.add_argument(
+        "--format",
+        nargs="+",
+        choices=["json", "sarif", "markdown"],
+        default=["json"],
+        help="Output formats to emit (default json). Multiple allowed; sibling files are written next to --out.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -151,8 +251,29 @@ def main() -> int:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(d, indent=2, default=str), encoding="utf-8")
+
+    written = [out_path]
+    formats = set(args.format)
+    if formats - {"json"}:
+        report_dict = _scan_result_to_report_dict(d, target)
+        if "sarif" in formats:
+            sarif_path = out_path.with_suffix(".sarif")
+            sarif_path.write_text(
+                json.dumps(_sarif_with_real_paths(report_dict), indent=2, default=str),
+                encoding="utf-8",
+            )
+            written.append(sarif_path)
+        if "markdown" in formats:
+            md_path = out_path.with_suffix(".md")
+            md_path.write_text(
+                generate_markdown_report(report_dict),
+                encoding="utf-8",
+            )
+            written.append(md_path)
+
     _print_section("Output")
-    print(f"  full result JSON: {out_path}")
+    for p in written:
+        print(f"  {p.suffix.lstrip('.') or 'json':8s} -> {p}")
     print()
 
     if result.status == ScanStatus.FAILED:
