@@ -171,6 +171,205 @@ def test_crypto_rpl_001_nonce_or_usedhashes_is_not_confirmed(src):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# CRYPTO-DSM-001 (Domain-Separator Mutability / Semantic Mismatch)
+# ──────────────────────────────────────────────────────────────────────
+
+_DSM_VULN_MUTABLE = """
+pragma solidity ^0.8.0;
+contract V {
+    bytes32 public DOMAIN_SEPARATOR;
+    function init(bytes32 ds) external { DOMAIN_SEPARATOR = ds; }
+}
+"""
+
+_DSM_VULN_CONSTANT = """
+pragma solidity ^0.8.0;
+contract V {
+    bytes32 public constant DOMAIN_SEPARATOR =
+        0x1111111111111111111111111111111111111111111111111111111111111111;
+}
+"""
+
+_DSM_VULN_BUILDER = """
+pragma solidity ^0.8.0;
+contract V {
+    function domain(address verifyingContract) public view returns (bytes32) {
+        return keccak256(abi.encode(
+            keccak256("EIP712Domain(string name,address verifyingContract)"),
+            keccak256(bytes("X")),
+            verifyingContract
+        ));
+    }
+}
+"""
+
+_DSM_SAFE_IMMUTABLE = """
+pragma solidity ^0.8.0;
+contract S {
+    bytes32 public immutable DOMAIN_SEPARATOR;
+    constructor() {
+        DOMAIN_SEPARATOR = keccak256(abi.encode(
+            keccak256("EIP712Domain(uint256 chainId,address verifyingContract)"),
+            block.chainid,
+            address(this)
+        ));
+    }
+}
+"""
+
+_DSM_SAFE_OZ = """
+pragma solidity ^0.8.0;
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+contract S is EIP712 {
+    constructor() EIP712("S", "1") {}
+    bytes32 public DOMAIN_SEPARATOR;
+}
+"""
+
+
+def test_crypto_dsm_001_mutable_storage_is_confirmed():
+    r = _run("CRYPTO-DSM-001", _DSM_VULN_MUTABLE, line_number=4)
+    assert r is not None
+    assert r.exploit_class == ExploitConfidence.CONFIRMED, r.explanation
+    assert r.attack_vector == "domain_separator_mutable"
+
+
+def test_crypto_dsm_001_constant_literal_is_conditional():
+    r = _run("CRYPTO-DSM-001", _DSM_VULN_CONSTANT, line_number=4)
+    assert r is not None
+    assert r.exploit_class == ExploitConfidence.CONDITIONAL, r.explanation
+    assert r.attack_vector == "domain_separator_fork_replay"
+
+
+def test_crypto_dsm_001_builder_missing_identity_is_confirmed():
+    line = next(
+        i + 1
+        for i, ln in enumerate(_DSM_VULN_BUILDER.splitlines())
+        if "keccak256(abi.encode(" in ln
+    )
+    r = _run("CRYPTO-DSM-001", _DSM_VULN_BUILDER, line_number=line)
+    assert r is not None
+    assert r.exploit_class == ExploitConfidence.CONFIRMED, r.explanation
+    assert r.attack_vector == "domain_builder_missing_identity"
+
+
+def test_crypto_dsm_001_immutable_constructor_is_not_confirmed():
+    r = _run("CRYPTO-DSM-001", _DSM_SAFE_IMMUTABLE, line_number=4)
+    assert r is not None
+    assert r.exploit_class != ExploitConfidence.CONFIRMED, r.explanation
+
+
+def test_crypto_dsm_001_oz_eip712_is_disproven():
+    r = _run("CRYPTO-DSM-001", _DSM_SAFE_OZ, line_number=5)
+    assert r is not None
+    assert r.exploit_class == ExploitConfidence.DISPROVEN, r.explanation
+    assert r.attack_vector == "domain_oz_eip712"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# INTENT-RDR-001 / INTENT-PMT-001 (intent / permit authorization gaps)
+# ──────────────────────────────────────────────────────────────────────
+
+from novel_analyzers import IntentAuthAnalyzer  # noqa: E402
+
+
+def _run_intent(vuln_id_filter: str, source: str, *, file_path: str = "Test.sol"):
+    """Run IntentAuthAnalyzer end-to-end through the verifier chain."""
+    findings = [
+        f for f in IntentAuthAnalyzer(source, file_path).analyze()
+        if f["id"] == vuln_id_filter
+    ]
+    if not findings:
+        return None
+    results = verify_all_findings(findings, {file_path: source})
+    return results[0] if results else None
+
+
+_RDR_VULN_CRITICAL = """
+pragma solidity ^0.8.0;
+contract V {
+    function fill(bytes calldata orderData) external {
+        (address recipient, uint256 amount, address filler) =
+            abi.decode(orderData, (address recipient, uint256 amount, address filler));
+        // recipient + filler unbound
+        require(amount > 0);
+    }
+}
+"""
+
+_RDR_SAFE = """
+pragma solidity ^0.8.0;
+contract S {
+    function fill(bytes calldata orderData) external {
+        (address recipient, uint256 amount, address filler) =
+            abi.decode(orderData, (address recipient, uint256 amount, address filler));
+        require(recipient != address(0));
+        require(filler == msg.sender);
+        require(amount > 0);
+        payable(recipient).transfer(amount);
+    }
+}
+"""
+
+_PMT_VULN = """
+pragma solidity ^0.8.0;
+interface IERC20Permit {
+    function permit(address,address,uint256,uint256,uint8,bytes32,bytes32) external;
+    function transferFrom(address,address,uint256) external;
+}
+contract V {
+    function pull(IERC20Permit token, address from, uint256 amt,
+                  uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+        token.permit(from, address(this), amt, deadline, v, r, s);
+        token.transferFrom(from, address(this), amt);
+    }
+}
+"""
+
+_PMT_SAFE_TRY = """
+pragma solidity ^0.8.0;
+interface IERC20Permit {
+    function permit(address,address,uint256,uint256,uint8,bytes32,bytes32) external;
+    function transferFrom(address,address,uint256) external;
+    function allowance(address,address) external view returns (uint256);
+}
+contract S {
+    function pull(IERC20Permit token, address from, uint256 amt,
+                  uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+        try token.permit(from, address(this), amt, deadline, v, r, s) {} catch {}
+        require(token.allowance(from, address(this)) >= amt, "NO_ALLOWANCE");
+        token.transferFrom(from, address(this), amt);
+    }
+}
+"""
+
+
+def test_intent_rdr_001_critical_unbound_is_confirmed():
+    r = _run_intent("INTENT-RDR-001", _RDR_VULN_CRITICAL)
+    assert r is not None, "analyzer failed to fire"
+    assert r.exploit_class == ExploitConfidence.CONFIRMED, r.explanation
+    assert r.attack_vector == "intent_redirection_critical"
+    assert r.severity_adjustment == "upgrade_to_HIGH"
+
+
+def test_intent_rdr_001_all_bound_is_not_flagged():
+    r = _run_intent("INTENT-RDR-001", _RDR_SAFE)
+    assert r is None, "safe fixture should not produce a finding"
+
+
+def test_intent_pmt_001_unguarded_is_conditional():
+    r = _run_intent("INTENT-PMT-001", _PMT_VULN)
+    assert r is not None, "analyzer failed to fire"
+    assert r.exploit_class == ExploitConfidence.CONDITIONAL, r.explanation
+    assert r.attack_vector == "ghost_permit_bypass"
+
+
+def test_intent_pmt_001_try_catch_plus_allowance_is_not_flagged():
+    r = _run_intent("INTENT-PMT-001", _PMT_SAFE_TRY)
+    assert r is None, "safe fixture should not produce a finding"
+
+
+# ──────────────────────────────────────────────────────────────────────
 # SWC-107 (reentrancy CEI violation)
 # ──────────────────────────────────────────────────────────────────────
 

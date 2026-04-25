@@ -10,7 +10,9 @@
     },
     {
       "file": "safe_ownable.sol",
-      "must_find": []
+      "classification": "safe",
+      "must_find": [],
+      "allowed_findings": ["ACCESS-002"]
     }
   ]
 }

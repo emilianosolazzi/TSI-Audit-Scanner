@@ -262,7 +262,7 @@ KNOWN_VULNERABILITIES = {
         "pattern": r"(?:rand|random|seed|entropy).*block\.(timestamp|number|difficulty)|keccak256.*block\.",
         "description": "Block variables used for randomness can be manipulated by miners",
         "recommendation": "Use Chainlink VRF or commit-reveal scheme",
-        "exclude_context": ["deadline", "ensure", "expired", "EXPIRED"]
+        "exclude_context": ["deadline", "ensure", "expired", "EXPIRED", "DOMAIN_SEPARATOR", "chainid"]
     },
     "SWC-116": {
         "name": "Timestamp Dependence",
@@ -546,7 +546,7 @@ KNOWN_VULNERABILITIES = {
         "pattern": r"ecrecover\s*\([^)]*\)",
         "description": "Raw ecrecover is vulnerable to signature malleability (s-value manipulation). An attacker can produce a second valid signature.",
         "recommendation": "Use OpenZeppelin ECDSA.recover() which enforces lower-s values per EIP-2",
-        "exclude_if": ["ECDSA.recover", "ECDSA.tryRecover", "s <= 0x7FFFFFFF", "SignatureChecker"]
+        "exclude_if": ["ECDSA.recover", "ECDSA.tryRecover", "s <= 0x7FFFFFFF", "uint256(s) <=", "HALF_ORDER", "SignatureChecker"]
     },
     "SIG-004": {
         "name": "Missing EIP-712 Domain Separator",
@@ -993,7 +993,7 @@ KNOWN_VULNERABILITIES = {
         "name": "Emergency Withdraw Bypasses Pause",
         "severity": Severity.CRITICAL,
         "category": Category.LOGIC,
-        "pattern": r"function\s+(?:emergencyWithdraw|rescue|sweep)\s*\([^)]*\)\s*(?:external|public)(?:(?!nonReentrant|whenNotPaused|_.*modifier).)*\{[^}]*transfer|send",
+        "pattern": r"function\s+(?:emergencyWithdraw|rescue|sweep)\s*\([^)]*\)\s*(?:external|public)(?:(?!nonReentrant|whenNotPaused|_.*modifier).)*\{[^}]*(?:transfer|send)\s*\(",
         "description": "Emergency function can execute even when protocol is paused. Attacker exploits pause state to execute privileged operations.",
         "recommendation": "Apply consistency: either emergency functions are NOT exit functions (just for recovery), OR they respect pause state. Document the invariant.",
         "protection_check": "pause_state",

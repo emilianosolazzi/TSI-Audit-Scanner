@@ -15,6 +15,7 @@ from advanced_auditor import (
     KNOWN_VULNERABILITIES, PROTECTION_PATTERNS, Severity, Category,
     Finding, DiamondStorageAnalyzer,
     CrossFunctionReentrancyGraph, FlashLoanArbitrageAnalyzer, MEVSandwichAnalyzer,
+    render_report_for_cli,
 )
 from report_generator import generate_markdown_report, generate_sarif_report
 
@@ -541,9 +542,32 @@ class TestReportGeneration:
     def test_markdown_report_has_all_sections(self, sample_report):
         md = generate_markdown_report(sample_report)
         assert "## Executive Summary" in md
+        assert "## Deployment Recommendation" in md
         assert "## Findings Breakdown" in md
         assert "## Contract Analysis" in md
+        assert "## Cross-Finding Coupling" in md
+        assert "## Priority Remediation Roadmap" in md
+        assert "## Bonus Hardening Suggestions" in md
         assert "## Detailed Findings" in md
+
+    def test_markdown_report_renders_narrative_sections(self, sample_report):
+        sample_report["findings"][0]["verification"] = {
+            "explanation": "3/4 exploit preconditions are present, so the issue is plausibly exploitable.",
+            "conditions_met": ["external call present", "state write after call"],
+            "conditions_failed": ["no explicit attacker-controlled callback proven"],
+            "poc_hint": "function testPoC() public { /* ... */ }",
+        }
+        sample_report["findings"][0]["pre_fix_snippet"] = "balances[msg.sender] -= amount;"
+        sample_report["findings"][0]["post_fix_snippet"] = "_nonReentrantBefore(); balances[msg.sender] -= amount;"
+        sample_report["findings"][0]["regression_tests"] = ["test_reentrancy_guard_blocks_reentry"]
+
+        md = generate_markdown_report(sample_report)
+
+        assert "**Exploit Story:**" in md
+        assert "**Verification Signal:**" in md
+        assert "**Pre-fix Code:**" in md
+        assert "**Post-fix Code:**" in md
+        assert "test_reentrancy_guard_blocks_reentry" in md
 
     def test_sarif_report_structure(self, sample_report):
         sarif = generate_sarif_report(sample_report)
@@ -574,6 +598,58 @@ class TestReportGeneration:
         }
         md = generate_markdown_report(report)
         assert "No security issues detected" in md
+
+    def test_markdown_report_uses_verifier_triage_for_release_planning(self):
+        report = {
+            "contract": {"address": "0x0", "chain": "git-repo", "name": "TriageCase", "verified": True},
+            "scores": {"security_score": 25, "risk_level": "CRITICAL"},
+            "summary": {"total_findings": 1, "critical": 1, "high": 0, "medium": 0, "low": 0, "gas": 0, "info": 0},
+            "analysis": {"interfaces": [], "defi_protocols": [], "access_control": None, "functions": {}},
+            "findings": [
+                {
+                    "id": "PAUSE-001",
+                    "severity": "CRITICAL",
+                    "category": "Business Logic",
+                    "title": "Emergency Withdraw Bypasses Pause",
+                    "description": "Emergency function can execute while paused.",
+                    "recommendation": "Verify pause semantics manually.",
+                    "confidence": 0.8,
+                    "verification": {
+                        "exploitable": False,
+                        "explanation": "Contract has no pause mechanism, so this is not applicable.",
+                        "conditions_failed": ["no pause mechanism"],
+                    },
+                }
+            ],
+            "timestamp": "2026-01-01T00:00:00",
+            "duration_ms": 100,
+        }
+
+        md = generate_markdown_report(report)
+
+        assert "**Decision:** DEPLOY WITH CONDITIONS" in md
+        assert "Verifier triage marked **1** raw finding" in md
+        assert "Release blockers from this run" not in md
+        assert "Emergency Withdraw Bypasses Pause" in md
+
+    def test_advanced_cli_markdown_uses_shared_renderer(self, sample_report):
+        class StubReport:
+            def to_dict(self):
+                return sample_report
+
+        rendered = render_report_for_cli(StubReport(), fmt="markdown")
+        assert "## Deployment Recommendation" in rendered
+        assert "## Priority Remediation Roadmap" in rendered
+        assert "TestContract" in rendered
+
+    def test_advanced_cli_sarif_uses_shared_renderer(self, sample_report):
+        class StubReport:
+            def to_dict(self):
+                return sample_report
+
+        rendered = render_report_for_cli(StubReport(), fmt="sarif")
+        assert '"version": "2.1.0"' in rendered
+        assert '"ruleId": "SWC-107"' in rendered
 
 
 # ===================================================

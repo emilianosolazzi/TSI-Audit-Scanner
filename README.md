@@ -110,6 +110,24 @@ python scan.py https://github.com/owner/repo \
 python scan.py path/to/repo --no-forge
 ```
 
+### False-positive benchmark gate
+
+The scanner includes a known-safe Solidity corpus for tracking false-positive
+drift across common audited patterns. Phase 7 Forge runtime findings are
+disabled by default so the gate measures source-level precision.
+
+```bash
+python scripts/run_benchmark.py \
+  --corpus tests/fp_benchmark_corpus \
+  --output benchmarks/results/fp_latest.json \
+  --min-precision 1 \
+  --min-recall 1 \
+  --max-safe-fp-rate 0
+```
+
+Use `--with-forge-plugin` only when you explicitly want runtime adapter
+findings included in the benchmark output.
+
 ### Option B — REST API + scheduler
 
 ```bash
@@ -338,7 +356,8 @@ The pattern engine covers:
 | Category | Examples |
 |----------|----------|
 | **Consistency (TSI)** | Callback state exposure, CEI violations, oracle temporal inconsistency, access control contradictions |
-| **Cryptographic access control** | `CRYPTO-IDM-001` (truncated identity hash), `CRYPTO-MAL-001` (ECDSA s-malleability), `CRYPTO-CTX-001` (missing chainId / verifyingContract domain), `CRYPTO-RPL-001` (signature replay / missing nonce) |
+| **Cryptographic access control** | `CRYPTO-IDM-001` (truncated identity hash), `CRYPTO-MAL-001` (ECDSA s-malleability), `CRYPTO-CTX-001` (missing chainId / verifyingContract domain), `CRYPTO-RPL-001` (signature replay / missing nonce), `CRYPTO-DSM-001` (domain-separator mutability / semantic mismatch) |
+| **Intent / Permit (ERC-7683 / Permit2)** | `INTENT-RDR-001` (intent redirection / unbound `orderData` field — implicit parameter injection), `INTENT-PMT-001` (ghost-permit bypass — `permit()` + `transferFrom` without try/catch or allowance recheck) |
 | Reentrancy | State after external call, cross-function, read-only |
 | Access Control | Missing modifiers, unprotected selfdestruct, tx.origin |
 | Oracle | Price manipulation, stale data, single-source dependency |

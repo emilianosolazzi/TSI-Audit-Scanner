@@ -1,0 +1,105 @@
+{
+  "schema_version": "1",
+  "name": "known-safe false-positive seed corpus",
+  "description": "Representative safe contract shapes modeled after widely audited protocol families. Every unexpected finding in this corpus is counted as a false positive.",
+  "policy": {
+    "default_classification": "safe",
+    "unexpected_findings_are_false_positives": true,
+    "forge_plugin_default": false
+  },
+  "targets_to_expand": [
+    "OpenZeppelin Contracts v4.9+ and v5.0",
+    "Uniswap v4 core and periphery",
+    "Aave v3 core",
+    "Compound III Comet",
+    "Safe v1.3+",
+    "ERC-4337 EntryPoint"
+  ],
+  "cases": [
+    {
+      "file": "contracts/OpenZeppelinOwnableSafe.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "allowed_findings": ["ACCESS-002"],
+      "provenance": "local representative fixture: OpenZeppelin Ownable-style access control",
+      "notes": "Admin path is protected by onlyOwner. ACCESS-002 is retained as an informational centralization limitation rather than a vulnerability."
+    },
+    {
+      "file": "contracts/OpenZeppelinReentrancyGuardedVault.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: OpenZeppelin ReentrancyGuard-style withdrawal",
+      "notes": "External call is guarded and state is updated before interaction."
+    },
+    {
+      "file": "contracts/OpenZeppelinSafeCastUsage.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: OpenZeppelin SafeCast-style bounded cast",
+      "notes": "Downcast is guarded by an explicit upper-bound check."
+    },
+    {
+      "file": "contracts/OpenZeppelinECDSAUsage.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: ECDSA helper with zero-address rejection",
+      "notes": "Signature recovery checks address(0), nonce, domain separator, and canonical s bound."
+    },
+    {
+      "file": "contracts/SafeERC20Wrapper.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: SafeERC20-style optional return wrapper",
+      "notes": "Low-level call is isolated in a library wrapper and validates return data."
+    },
+    {
+      "file": "contracts/UniswapV4HookGuarded.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: Uniswap v4 hook-style pool-manager guard",
+      "notes": "Hook callback validates msg.sender and settles transient state."
+    },
+    {
+      "file": "contracts/AaveV3PoolFacadeSafe.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: Aave v3 pool facade access and pause controls",
+      "notes": "Risk knobs are role-gated and flash-loan callback validates initiator."
+    },
+    {
+      "file": "contracts/CompoundCometFacadeSafe.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: Compound III Comet-style collateral accounting",
+      "notes": "Collateral operations use bounded math and explicit market pause checks."
+    },
+    {
+      "file": "contracts/SafeMultisigModule.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: Safe module owner/nonce execution",
+      "notes": "Execution uses nonce replay protection and threshold authorization."
+    },
+    {
+      "file": "contracts/ERC4337EntryPointGuarded.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: ERC-4337 EntryPoint-style nonce and prefund checks",
+      "notes": "User operation path validates nonce and prefund before execution."
+    },
+    {
+      "file": "contracts/ERC4626PreviewSafe.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: ERC-4626 preview/actual consistency",
+      "notes": "Preview and deposit use the same conversion path."
+    },
+    {
+      "file": "contracts/ChainlinkTwapSafe.sol",
+      "classification": "safe",
+      "expected_findings": [],
+      "provenance": "local representative fixture: oracle staleness and TWAP guard",
+      "notes": "Oracle read checks updatedAt and answeredInRound, then applies a TWAP bound."
+    }
+  ]
+}

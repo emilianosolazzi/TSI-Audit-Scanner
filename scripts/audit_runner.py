@@ -55,6 +55,8 @@ def main() -> None:
     benchmark.add_argument("--output", default="benchmarks/results/latest.json", help="Output report path")
     benchmark.add_argument("--min-precision", type=float, default=0.8)
     benchmark.add_argument("--min-recall", type=float, default=0.8)
+    benchmark.add_argument("--max-safe-fp-rate", type=float, default=0.0)
+    benchmark.add_argument("--with-forge-plugin", action="store_true")
 
     all_cmd = subparsers.add_parser("all", help="Run benchmark, then full E2E, then plugin-backed grading")
     all_cmd.add_argument("--url", help="Repository URL to scan")
@@ -65,6 +67,8 @@ def main() -> None:
     all_cmd.add_argument("--benchmark-output", default="benchmarks/results/latest.json", help="Output report path")
     all_cmd.add_argument("--min-precision", type=float, default=0.8)
     all_cmd.add_argument("--min-recall", type=float, default=0.8)
+    all_cmd.add_argument("--max-safe-fp-rate", type=float, default=0.0)
+    all_cmd.add_argument("--benchmark-with-forge-plugin", action="store_true")
     all_cmd.add_argument("--max-confirmed-true", type=int, default=0)
     all_cmd.add_argument("--max-critical-manual", type=int, default=0)
     all_cmd.add_argument("--max-high-manual", type=int, default=3)
@@ -148,7 +152,11 @@ def main() -> None:
             str(args.min_precision),
             "--min-recall",
             str(args.min_recall),
+            "--max-safe-fp-rate",
+            str(args.max_safe_fp_rate),
         ]
+        if args.with_forge_plugin:
+            cmd.append("--with-forge-plugin")
         raise SystemExit(_run(cmd, root_dir))
 
     if args.command == "all":
@@ -163,7 +171,11 @@ def main() -> None:
             str(args.min_precision),
             "--min-recall",
             str(args.min_recall),
+            "--max-safe-fp-rate",
+            str(args.max_safe_fp_rate),
         ]
+        if args.benchmark_with_forge_plugin:
+            benchmark_cmd.append("--with-forge-plugin")
         rc = _run(benchmark_cmd, root_dir)
         if rc != 0:
             raise SystemExit(rc)

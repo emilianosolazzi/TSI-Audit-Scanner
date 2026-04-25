@@ -624,6 +624,30 @@ class RepoScanner:
         if vuln_id == "TOKEN-007" and cls._FP_TIMESTAMP_DOWNCAST_RE.search(line):
             return True
 
+        # ACCESS-001 / DEFI-006: user self-service withdrawals that debit
+        # msg.sender-scoped accounting are not admin functions and do not
+        # imply a missing global pause switch by themselves.
+        if vuln_id in {"ACCESS-001", "DEFI-006"}:
+            window = "\n".join(
+                lines[max(0, line_no - 1): min(len(lines), line_no + 12)]
+            )
+            if re.search(r"function\s+withdraw\w*", line, re.IGNORECASE) and re.search(
+                r"(?:balances|balance|collateral)\s*\[\s*msg\.sender\s*\]",
+                window,
+                re.IGNORECASE,
+            ):
+                return True
+
+        # DOS-004: `(bool success,) = target.call(...)` discards return data,
+        # so it is not the returndata-copy return-bomb shape this rule means.
+        if vuln_id == "DOS-004" and re.search(r"\(\s*bool\s+\w+\s*,\s*\)\s*=", line):
+            return True
+
+        # GAS-003: `type(T).max` inside a require is a compile-time constant,
+        # not a state-variable SLOAD.
+        if vuln_id == "GAS-003" and "type(" in line:
+            return True
+
         # ADVANCED-002: empty receive()/fallback() with no body has no
         # state effect and no auth surface.
         if vuln_id == "ADVANCED-002":

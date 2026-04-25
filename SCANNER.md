@@ -134,8 +134,14 @@ overrides the pattern-database severity when verifier confidence warrants.
 
 ```powershell
 python -m pytest tests/test_verifier_regression.py -q
+python scripts/run_benchmark.py --corpus tests/fp_benchmark_corpus --output benchmarks/results/fp_latest.json --min-precision 1 --min-recall 1 --max-safe-fp-rate 0
 ```
 
 Each test in `tests/test_verifier_regression.py` exercises a single
 `VERIFIER_MAP` branch with both a vulnerable and a properly guarded
 fixture. Add a paired test whenever you add a new verifier branch.
+
+The false-positive benchmark corpus in `tests/fp_benchmark_corpus` tracks
+known-safe audited patterns. Unexpected findings fail the gate; retained
+informational signals should be listed as `allowed_findings` in the corpus
+manifest so they stay visible without counting as false positives.
