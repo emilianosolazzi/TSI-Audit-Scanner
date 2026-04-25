@@ -219,3 +219,126 @@ def test_swc_107_nonreentrant_guarded_is_not_confirmed():
     r = _run("SWC-107", _REENT_SAFE, line_number=9)
     assert r is not None
     assert r.exploit_class != ExploitConfidence.CONFIRMED, r.explanation
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Calibration regressions — radiant-v2 false-positive lessons
+# ──────────────────────────────────────────────────────────────────────
+
+# (a) ECDSA malleability is neutralized when the signed digest binds an
+#     in-contract nonce that the function consumes in the same body.
+#     Mirrors radiant-capital/v2 contracts/lending/tokenization/AToken.sol
+#     permit() exactly — was wrongly CONFIRMED before this fix.
+_MAL_NEUTRALIZED_BY_NONCE = """
+pragma solidity ^0.8.0;
+contract A {
+    bytes32 public constant PERMIT_TYPEHASH = keccak256("Permit(address,uint256,uint256)");
+    bytes32 public DOMAIN_SEPARATOR;
+    mapping(address => uint256) public _nonces;
+    function permit(address owner, uint256 value, uint8 v, bytes32 r, bytes32 s) external {
+        uint256 currentValidNonce = _nonces[owner];
+        bytes32 digest = keccak256(abi.encodePacked(
+            "\\x19\\x01", DOMAIN_SEPARATOR,
+            keccak256(abi.encode(PERMIT_TYPEHASH, owner, value, currentValidNonce))
+        ));
+        require(owner == ecrecover(digest, v, r, s), "INVALID_SIGNATURE");
+        _nonces[owner] = currentValidNonce + 1;
+    }
+}
+"""
+
+
+def test_crypto_mal_001_neutralized_by_in_contract_nonce():
+    """When the function consumes an in-contract nonce in the same body,
+    the malleated twin cannot replay on-chain — verifier must NOT CONFIRM."""
+    line = next(
+        i + 1
+        for i, ln in enumerate(_MAL_NEUTRALIZED_BY_NONCE.splitlines())
+        if "ecrecover(" in ln
+    )
+    r = _run("CRYPTO-MAL-001", _MAL_NEUTRALIZED_BY_NONCE, line_number=line)
+    assert r is not None
+    assert r.exploit_class != ExploitConfidence.CONFIRMED, r.explanation
+    # Verifier should still surface the residual off-chain risk via the
+    # CONDITIONAL class with downgraded severity, not silently DISPROVE.
+    assert r.attack_vector in {
+        "malleability_neutralized_by_nonce",
+        "malleability_protected",
+    }, r.attack_vector
+
+
+# (b) Stateless multicall-style forwarders: reentrancy on contracts that
+#     hold no value-bearing storage and forward to caller-supplied
+#     targets cannot corrupt anything. Mirrors radiant-capital/v2
+#     contracts/radiant/accessories/Multicall3.sol — wrongly CONFIRMED
+#     before this fix.
+_MULTICALL3_LIKE = """
+pragma solidity 0.8.12;
+contract Multicall3 {
+    struct Call3Value { address target; bool allowFailure; uint256 value; bytes callData; }
+    struct Result { bool success; bytes returnData; }
+    function aggregate3Value(Call3Value[] calldata calls) public payable returns (Result[] memory returnData) {
+        uint256 length = calls.length;
+        returnData = new Result[](length);
+        Call3Value calldata calli;
+        for (uint256 i = 0; i < length; ) {
+            Result memory result = returnData[i];
+            calli = calls[i];
+            (result.success, result.returnData) = calli.target.call{value: calli.value}(calli.callData);
+            unchecked { ++i; }
+        }
+    }
+}
+"""
+
+
+def test_swc_107_stateless_multicall_forwarder_is_disproven():
+    """Multicall3-shaped forwarders have no value-bearing storage and
+    forward to caller-supplied targets. Reentrancy is moot — verifier
+    must DISPROVE, not CONFIRM."""
+    line = next(
+        i + 1
+        for i, ln in enumerate(_MULTICALL3_LIKE.splitlines())
+        if ".target.call" in ln
+    )
+    r = _run(
+        "SWC-107",
+        _MULTICALL3_LIKE,
+        line_number=line,
+        file_path="contracts/radiant/accessories/Multicall3.sol",
+    )
+    assert r is not None
+    assert r.exploit_class == ExploitConfidence.DISPROVEN, r.explanation
+    assert r.attack_vector == "stateless_forwarder", r.attack_vector
+
+
+# (c) Negative control: the stateless-forwarder gate must NOT silence a
+#     real reentrancy on a value-bearing contract that happens to use a
+#     forwarding pattern.
+_VALUE_BEARING_FORWARDER = """
+pragma solidity ^0.8.0;
+contract Bank {
+    mapping(address => uint256) public balance;
+    function withdraw(address target) external {
+        uint256 amt = balance[msg.sender];
+        (bool ok, ) = target.call{value: amt}("");
+        require(ok);
+        balance[msg.sender] = 0;
+    }
+}
+"""
+
+
+def test_swc_107_value_bearing_forwarder_still_confirmed():
+    line = next(
+        i + 1
+        for i, ln in enumerate(_VALUE_BEARING_FORWARDER.splitlines())
+        if "target.call" in ln
+    )
+    r = _run("SWC-107", _VALUE_BEARING_FORWARDER, line_number=line)
+    assert r is not None
+    assert r.exploit_class in {
+        ExploitConfidence.CONFIRMED,
+        ExploitConfidence.LIKELY,
+    }, r.explanation
+    assert r.attack_vector != "stateless_forwarder", r.attack_vector
