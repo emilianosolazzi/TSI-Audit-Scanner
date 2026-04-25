@@ -32,4 +32,11 @@ contract ReadOnlyReentrancyAdapterTest is Test, TSIBase {
         Contradiction memory contradiction = captureContradiction(adapter, abi.encode(100 ether));
         assertFalse(contradiction.contradiction, "unexpected read-only reentrancy mismatch");
     }
+
+    function test_reverts_when_callback_context_changes_shares() public {
+        adapter.executeExploit(abi.encode(100 ether, 300 ether));
+
+        vm.expectRevert("ReadOnlyReentrancyAdapter: callback shares mismatch");
+        vault.triggerReadOnlyWindow(300 ether, address(adapter), abi.encode(101 ether));
+    }
 }

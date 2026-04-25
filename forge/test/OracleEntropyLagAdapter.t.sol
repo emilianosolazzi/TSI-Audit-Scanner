@@ -40,4 +40,24 @@ contract OracleEntropyLagAdapterTest is Test, TSIBase {
         Contradiction memory contradiction = captureContradiction(adapter, bytes(""));
         assertFalse(contradiction.contradiction, "unexpected contradiction on matching oracle rounds");
     }
+
+    function test_no_contradiction_when_latest_round_is_inside_heartbeat() public {
+        uint256 nowTs = block.timestamp;
+        feed.setRound(1, 2000e8, nowTs - 500);
+        feed.setRound(2, 2000e8, nowTs - 300);
+        adapter = new OracleEntropyLagAdapter(address(feed), 600);
+
+        Contradiction memory contradiction = captureContradiction(adapter, bytes(""));
+        assertFalse(contradiction.contradiction, "fresh oracle round should not be stale");
+    }
+
+    function test_detects_stale_latest_round_beyond_heartbeat() public {
+        uint256 nowTs = block.timestamp;
+        feed.setRound(1, 2000e8, nowTs - 1200);
+        feed.setRound(2, 2000e8, nowTs - 900);
+        adapter = new OracleEntropyLagAdapter(address(feed), 600);
+
+        Contradiction memory contradiction = assertContradiction(adapter, bytes(""), "expected stale oracle round");
+        assertEq(contradiction.tau1.numericValue, contradiction.tau2.numericValue);
+    }
 }

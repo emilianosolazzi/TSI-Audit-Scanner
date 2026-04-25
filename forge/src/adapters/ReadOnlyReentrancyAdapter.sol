@@ -123,6 +123,7 @@ contract ReadOnlyReentrancyAdapter is ITSIAdapter, IReadOnlyReentrancyObserver {
     function onReadOnlyReentrant(bytes calldata callbackData) external returns (bytes memory) {
         require(msg.sender == address(vault), "ReadOnlyReentrancyAdapter: caller must be vault");
         uint256 shares = _decodeShares(callbackData);
+        require(shares == _lastShares, "ReadOnlyReentrancyAdapter: callback shares mismatch");
         _tau2Quote = vault.quoteRedeem(shares);
         _hasCallbackQuote = true;
         return abi.encode(_tau2Quote);

@@ -98,7 +98,7 @@ contract OracleEntropyLagAdapter is ITSIAdapter {
         (, uint256 updatedAt, uint256 staleness, uint256 heartbeat) = abi.decode(tau2.extraData, (uint80, uint256, uint256, uint256));
         uint256 roundInterval = updatedAt > prevUpdatedAt ? updatedAt - prevUpdatedAt : 0;
         bool priceChanged = tau1.numericValue != tau2.numericValue;
-        bool lagExists = staleness > 0 || roundInterval > heartbeat;
+        bool lagExists = staleness > heartbeat || roundInterval > heartbeat;
 
         if (priceChanged || lagExists) {
             return (true, "Oracle entropy lag detected across sequential rounds");

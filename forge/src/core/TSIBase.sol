@@ -61,7 +61,7 @@ abstract contract TSIBase {
         uint8 confidence
     ) internal view returns (TSIFinding memory finding) {
         Contradiction memory contradiction = captureContradiction(adapter, context);
-        ContradictionScore memory score = scoreContradiction(adapter, context, confidence);
+        ContradictionScore memory score = ContradictionMath.score(contradiction.tau1, contradiction.tau2, confidence);
 
         uint8 baselineWeight = TSISeverityScore.severityWeight(adapter.defaultSeverity());
         uint8 effectiveWeight = score.severityWeight > baselineWeight ? score.severityWeight : baselineWeight;
