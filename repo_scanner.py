@@ -799,6 +799,7 @@ class RepoScanner:
                 PrecompileCryptoAnalyzer,
                 MerkleProofVerifierAnalyzer,
                 CryptoAccessControlAnalyzer,
+                IntentAuthAnalyzer,
             )
         except Exception as exc:
             logger.debug("novel_analyzers unavailable: %s", exc)
@@ -827,6 +828,12 @@ class RepoScanner:
             )
         except Exception as exc:
             logger.debug("CryptoAccessControlAnalyzer failed on %s: %s", sol_file.path, exc)
+        try:
+            findings.extend(
+                IntentAuthAnalyzer(source, sol_file.path).analyze()
+            )
+        except Exception as exc:
+            logger.debug("IntentAuthAnalyzer failed on %s: %s", sol_file.path, exc)
         # Black-hat-oriented adversarial pass (lazy import).
         try:
             from adversarial_analyzers import AdversarialAnalyzer

@@ -4437,6 +4437,41 @@ def print_report(report: AuditReport, verbose: bool = False):
     print(f"{BOLD}{'='*70}{RESET}\n")
 
 
+def render_report_for_cli(report: AuditReport, fmt: str = "json", json_only: bool = False, verbose: bool = False) -> Optional[str]:
+    """Render an AuditReport for CLI/stdout without re-running analysis.
+
+    The legacy path (`print_report`) is preserved for human console output.
+    Structured/narrative formats are delegated to report_generator so the
+    on-chain CLI, Flask API, and repo scanner share one markdown/SARIF renderer.
+    """
+    report_dict = report.to_dict()
+    normalized = (fmt or "json").lower()
+
+    if json_only or normalized == "json":
+        return json.dumps(report_dict, indent=2)
+    if normalized in ("markdown", "md"):
+        from report_generator import generate_markdown_report
+        return generate_markdown_report(report_dict)
+    if normalized == "sarif":
+        from report_generator import generate_sarif_report
+        return json.dumps(generate_sarif_report(report_dict), indent=2)
+    if normalized in ("html", "pdf"):
+        raise ValueError(f"Format '{normalized}' is not supported by the CLI yet; use json, markdown, or sarif")
+
+    print_report(report, verbose)
+    return None
+
+
+def save_cli_report(report: AuditReport, output_path: str, fmt: str = "json") -> str:
+    """Save an AuditReport using the shared report generator."""
+    from report_generator import save_report
+
+    normalized = (fmt or "json").lower()
+    if normalized in ("html", "pdf"):
+        raise ValueError(f"Format '{normalized}' is not supported by the CLI yet; use json, markdown, or sarif")
+    return save_report(report.to_dict(), output_path, normalized)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Advanced Smart Contract Auditor",
@@ -4493,17 +4528,17 @@ def main():
     try:
         auditor = AdvancedAuditor(args.api_key, args.chain)
         report = auditor.audit(args.address)
-        
-        if args.json:
-            print(json.dumps(report.to_dict(), indent=2))
-        else:
+
+        rendered = render_report_for_cli(report, args.format, args.json, args.verbose)
+        if rendered is not None:
+            print(rendered)
+        elif not args.json:
             print_report(report, args.verbose)
-        
+
         if args.output:
-            with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(report.to_dict(), f, indent=2)
-            print(f"Report saved: {args.output}")
-        
+            saved_path = save_cli_report(report, args.output, "json" if args.json else args.format)
+            print(f"Report saved: {saved_path}")
+
         # NEW: Generate PoC tests for initialization vulnerabilities
         if args.generate_poc:
             poc_dir = args.poc_output or "poc_tests"
