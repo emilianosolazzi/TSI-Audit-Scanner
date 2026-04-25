@@ -88,3 +88,9 @@ reproduce_*.js
 
 # Private local validation artifacts
 private_validation_lab/
+
+# Local research / benchmarks / per-target PoC harnesses (never commit)
+benchmarks/
+research/
+btc_translator_lab/
+silo_v2_stale_oracle_poc/

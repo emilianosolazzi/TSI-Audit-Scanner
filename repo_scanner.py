@@ -149,7 +149,11 @@ class RepoScanner:
 
     def scan_repo(self, repo_url: str, branch: str = "main",
                   include_tests: bool = False,
-                  scope_paths: Optional[List[str]] = None) -> ScanResult:
+                  scope_paths: Optional[List[str]] = None,
+                  run_forge_plugin: bool = True,
+                  forge_plugin_dir: Optional[str] = None,
+                  forge_match_contract: str = "TSI_Findings_Report",
+                  forge_fork_url: Optional[str] = None) -> ScanResult:
         """
         Clone a repo and scan all Solidity files.
 
@@ -158,8 +162,12 @@ class RepoScanner:
             branch: Git branch to check out
             include_tests: Whether to scan test files
             scope_paths: Optional list of paths within repo to limit scan
+            run_forge_plugin: When True, also run the Foundry TSI plugin (Phase 7)
+            forge_plugin_dir: Override path to the Foundry TSI plugin harness
+            forge_match_contract: Forge --match-contract for the plugin run
+            forge_fork_url: Optional RPC URL for forked TSI execution
         Returns:
-            ScanResult with all findings
+            ScanResult with all findings (analyzers + validator + verifier + forge plugin)
         """
         started = datetime.now(timezone.utc)
         result = ScanResult(
@@ -255,10 +263,33 @@ class RepoScanner:
             except Exception as e:
                 logger.warning(f"Exploit verification phase failed: {e}")
 
-            result.status = ScanStatus.COMPLETE
-
-            # Build summary
+            # Build base summary BEFORE Phase 7 so forge_plugin entry survives.
             result.summary = self._build_summary(all_findings, source_files)
+
+            # 7. Foundry TSI plugin — runtime adapter findings (optional)
+            if run_forge_plugin:
+                try:
+                    forge_summary = self._run_forge_plugin(
+                        plugin_dir=forge_plugin_dir,
+                        match_contract=forge_match_contract,
+                        fork_url=forge_fork_url,
+                    )
+                    if forge_summary:
+                        result.summary["forge_plugin"] = forge_summary
+                        normalized = forge_summary.get("normalized_findings") or []
+                        if normalized:
+                            for nf in normalized:
+                                nf.setdefault("source", "forge_plugin")
+                            result.findings.extend(normalized)
+                            result.validated_findings.extend(normalized)
+                            logger.info(
+                                "Forge plugin contributed %d finding(s) (status=%s)",
+                                len(normalized), forge_summary.get("status"),
+                            )
+                except Exception as e:
+                    logger.warning(f"Forge plugin phase failed: {e}")
+
+            result.status = ScanStatus.COMPLETE
 
         except Exception as e:
             result.status = ScanStatus.FAILED
@@ -738,6 +769,7 @@ class RepoScanner:
                 GuardDominanceAnalyzer,
                 PrecompileCryptoAnalyzer,
                 MerkleProofVerifierAnalyzer,
+                CryptoAccessControlAnalyzer,
             )
         except Exception as exc:
             logger.debug("novel_analyzers unavailable: %s", exc)
@@ -760,6 +792,12 @@ class RepoScanner:
             )
         except Exception as exc:
             logger.debug("MerkleProofVerifierAnalyzer failed on %s: %s", sol_file.path, exc)
+        try:
+            findings.extend(
+                CryptoAccessControlAnalyzer(source, sol_file.path).analyze()
+            )
+        except Exception as exc:
+            logger.debug("CryptoAccessControlAnalyzer failed on %s: %s", sol_file.path, exc)
         # Black-hat-oriented adversarial pass (lazy import).
         try:
             from adversarial_analyzers import AdversarialAnalyzer
@@ -810,6 +848,58 @@ class RepoScanner:
         except Exception as exc:
             logger.debug("StorageSelectorAnalyzer failed: %s", exc)
             return []
+
+    # ------------------------------------------------------------------
+    # FORGE TSI PLUGIN (Phase 7)
+    # ------------------------------------------------------------------
+
+    def _run_forge_plugin(
+        self,
+        plugin_dir: Optional[str] = None,
+        match_contract: str = "TSI_Findings_Report",
+        fork_url: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Invoke the Foundry TSI plugin and return its summary dict.
+
+        Returns None when the plugin dir or `forge` binary is unavailable.
+        Never raises — failures are returned in the dict so the rest of the
+        scan pipeline can continue.
+        """
+        # Resolve plugin dir: caller override -> ./forge -> repo root /forge
+        candidate = plugin_dir or os.path.join(os.getcwd(), "forge")
+        plugin_path = Path(candidate)
+        if not plugin_path.is_absolute():
+            plugin_path = Path(os.getcwd()) / candidate
+        if not plugin_path.exists():
+            logger.debug("Forge plugin dir %s missing, skipping", plugin_path)
+            return None
+        if shutil.which("forge") is None:
+            logger.debug("`forge` not on PATH, skipping plugin phase")
+            return None
+
+        try:
+            scripts_dir = Path(__file__).resolve().parent / "scripts"
+            import sys as _sys
+            if str(scripts_dir) not in _sys.path:
+                _sys.path.insert(0, str(scripts_dir))
+            from tsi_plugin_runner import run_tsi_plugin  # type: ignore
+        except Exception as exc:
+            logger.warning("tsi_plugin_runner unavailable: %s", exc)
+            return None
+
+        outdir = Path(self.workspace_dir) / "forge_plugin_runs"
+        outdir.mkdir(parents=True, exist_ok=True)
+        try:
+            return run_tsi_plugin(
+                root_dir=Path(__file__).resolve().parent,
+                outdir=outdir,
+                plugin_dir=plugin_path,
+                fork_url=fork_url,
+                match_contract=match_contract,
+            )
+        except Exception as exc:
+            logger.warning("Forge plugin run raised: %s", exc)
+            return {"status": "error", "error": str(exc)}
 
     # ------------------------------------------------------------------
     # SUMMARY
