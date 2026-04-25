@@ -1807,6 +1807,11 @@ class SourceAnalyzer:
     # Patterns to strip comments
     COMMENT_BLOCK = re.compile(r"/\*.*?\*/", re.DOTALL)
     COMMENT_LINE = re.compile(r"//.*")
+    ADDRESS_RECONSTRUCTION_CAST = re.compile(r"\baddress\s*\(\s*uint160\s*\(", re.IGNORECASE)
+    INT128_UINT128_RETURN_CAST = re.compile(
+        r"\bint128\s*\(\s*uint128\s*\(\s*([A-Za-z_]\w*)\s*\)\s*\)",
+        re.IGNORECASE,
+    )
     
     def __init__(self, source_code: str, compiler_version: Optional[str] = None):
         self.original_source = source_code
@@ -1944,6 +1949,9 @@ class SourceAnalyzer:
 
                     if vuln_id == "SWC-106" and self._is_oz_selfdestruct_stub(context_around):
                         continue
+
+                    if vuln_id == "TOKEN-007" and self._is_safe_downcast_context(line_num, context_around):
+                        continue
                     
                     # Lower confidence for known AMM patterns
                     confidence = 0.8
@@ -1994,6 +2002,25 @@ class SourceAnalyzer:
         if "hasselfdestruct" in snippet:
             return True
         return False
+
+    def _is_safe_downcast_context(self, line_num: int, context: str) -> bool:
+        """Detect narrow casts that are already bounded or are address-domain reconstruction."""
+        line = self.lines[line_num - 1] if 0 < line_num <= len(self.lines) else ""
+
+        if self.ADDRESS_RECONSTRUCTION_CAST.search(line):
+            return True
+
+        cast_match = self.INT128_UINT128_RETURN_CAST.search(line)
+        if not cast_match:
+            return False
+
+        value_name = re.escape(cast_match.group(1))
+        bound_pattern = (
+            rf"{value_name}\s*>\s*(?:MAX_[A-Z0-9_]*|"
+            r"uint256\s*\(\s*uint128\s*\(\s*type\s*\(\s*int128\s*\)\s*\.max\s*\)\s*\)|"
+            r"type\s*\(\s*int128\s*\)\s*\.max)"
+        )
+        return bool(re.search(bound_pattern, context, re.IGNORECASE))
     
     def _get_snippet(self, line_num: int, context: int = 2) -> str:
         """Get code snippet around line number."""

@@ -7,6 +7,7 @@ Canonical Foundry package for temporal-state and oracle-composition findings use
 - Concrete adapters live under `src/adapters/`
 - Shared scoring and contradiction primitives live under `src/core/`, `src/interfaces/`, and `src/lib/`
 - Structured findings are emitted by `test/TSI_Findings_Report.t.sol`
+- Runtime adapter coverage includes oracle lag, TWAP skew, ERC-4626 donation previews, read-only reentrancy, governance snapshots, replay claims, SSV state, and fork-aware Aave flash-loan/oracle checks.
 
 ### Commands
 

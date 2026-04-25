@@ -608,6 +608,18 @@ class RepoScanner:
         r"(?:receive|fallback)\s*\(\s*\)\s*"
         r"external\s+payable\s*\{\s*\}"
     )
+    _FP_ADDRESS_RECONSTRUCTION_RE = re.compile(
+        r"\baddress\s*\(\s*uint160\s*\(",
+        re.IGNORECASE,
+    )
+    _FP_INT128_UINT128_RETURN_RE = re.compile(
+        r"\bint128\s*\(\s*uint128\s*\(\s*([A-Za-z_]\w*)\s*\)\s*\)",
+        re.IGNORECASE,
+    )
+    _AUTHORITY_CONTEXT_RE = re.compile(
+        r"\b(?:owner|operator|signer|guardian|validator|authority|admin|role|authorized)\b",
+        re.IGNORECASE,
+    )
 
     @classmethod
     def _is_known_false_positive(
@@ -623,6 +635,26 @@ class RepoScanner:
         # TOKEN-007: uint64(block.timestamp) is safe for ~584B years.
         if vuln_id == "TOKEN-007" and cls._FP_TIMESTAMP_DOWNCAST_RE.search(line):
             return True
+
+        if vuln_id == "TOKEN-007":
+            window = "\n".join(lines[max(0, line_no - 16): min(len(lines), line_no + 2)])
+
+            # address(uint160(x)) is common address-domain reconstruction.
+            # Keep it reportable only when the local context suggests the
+            # result is being used as an authority or role identity.
+            if cls._FP_ADDRESS_RECONSTRUCTION_RE.search(line) and not cls._AUTHORITY_CONTEXT_RE.search(window):
+                return True
+
+            cast_match = cls._FP_INT128_UINT128_RETURN_RE.search(line)
+            if cast_match:
+                value_name = re.escape(cast_match.group(1))
+                bound_pattern = (
+                    rf"{value_name}\s*>\s*(?:MAX_[A-Z0-9_]*|"
+                    r"uint256\s*\(\s*uint128\s*\(\s*type\s*\(\s*int128\s*\)\s*\.max\s*\)\s*\)|"
+                    r"type\s*\(\s*int128\s*\)\s*\.max)"
+                )
+                if re.search(bound_pattern, window, re.IGNORECASE):
+                    return True
 
         # ACCESS-001 / DEFI-006: user self-service withdrawals that debit
         # msg.sender-scoped accounting are not admin functions and do not

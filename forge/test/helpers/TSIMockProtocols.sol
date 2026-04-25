@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import {
-    IGovernanceVoteSource
-} from "src/adapters/GovernanceSnapshotVoteAdapter.sol";
+import {IGovernanceVoteSource} from "src/adapters/GovernanceSnapshotVoteAdapter.sol";
 import {IReplayClaimLedger} from "src/adapters/MerkleReplayClaimAdapter.sol";
 import {ISpotTwapOracle} from "src/adapters/UniswapV2TwapSkewAdapter.sol";
-import {
-    IERC4626DonationVault
-} from "src/adapters/ERC4626DonationPreviewAdapter.sol";
-import {
-    ISSVNetworkAdapter,
-    ISSVViewsAdapter
-} from "src/adapters/SSVStateContradictionAdapter.sol";
+import {IERC4626DonationVault} from "src/adapters/ERC4626DonationPreviewAdapter.sol";
+import {IReadOnlyReentrancyObserver, IReadOnlyReentrancyVault} from "src/adapters/ReadOnlyReentrancyAdapter.sol";
+import {ISSVNetworkAdapter, ISSVViewsAdapter} from "src/adapters/SSVStateContradictionAdapter.sol";
 
 contract MockERC4626DonationVault is IERC4626DonationVault {
     uint256 public totalAssets;
@@ -32,6 +26,34 @@ contract MockERC4626DonationVault is IERC4626DonationVault {
 
     function donate(uint256 assets) external {
         totalAssets += assets;
+    }
+}
+
+contract MockReadOnlyReentrancyVault is IReadOnlyReentrancyVault {
+    uint256 public totalAssets;
+    uint256 public totalSupply;
+
+    constructor(uint256 assets, uint256 supply) {
+        totalAssets = assets;
+        totalSupply = supply;
+    }
+
+    function quoteRedeem(uint256 shares) external view returns (uint256) {
+        if (totalSupply == 0 || totalAssets == 0) {
+            return 0;
+        }
+        return (shares * totalAssets) / totalSupply;
+    }
+
+    function triggerReadOnlyWindow(uint256 transientAssetsOut, address callbackTarget, bytes calldata callbackData)
+        external
+        returns (bytes memory result)
+    {
+        require(transientAssetsOut <= totalAssets, "MockReadOnlyReentrancyVault: insufficient assets");
+
+        totalAssets -= transientAssetsOut;
+        result = IReadOnlyReentrancyObserver(callbackTarget).onReadOnlyReentrant(callbackData);
+        totalAssets += transientAssetsOut;
     }
 }
 
@@ -123,11 +145,7 @@ contract MockSSVViews is ISSVViewsAdapter {
         nextBalance = balance;
     }
 
-    function getBalance(
-        address,
-        uint64[] memory,
-        ISSVNetworkAdapter.Cluster memory
-    ) external view returns (uint256) {
+    function getBalance(address, uint64[] memory, ISSVNetworkAdapter.Cluster memory) external view returns (uint256) {
         return nextBalance;
     }
 }

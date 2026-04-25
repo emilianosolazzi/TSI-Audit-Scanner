@@ -10,12 +10,14 @@ import {ERC4626DonationPreviewAdapter} from "src/adapters/ERC4626DonationPreview
 import {GovernanceSnapshotVoteAdapter} from "src/adapters/GovernanceSnapshotVoteAdapter.sol";
 import {MerkleReplayClaimAdapter} from "src/adapters/MerkleReplayClaimAdapter.sol";
 import {OracleEntropyLagAdapter} from "src/adapters/OracleEntropyLagAdapter.sol";
+import {ReadOnlyReentrancyAdapter} from "src/adapters/ReadOnlyReentrancyAdapter.sol";
 import {SSVStateContradictionAdapter, ISSVNetworkAdapter} from "src/adapters/SSVStateContradictionAdapter.sol";
 import {UniswapV2TwapSkewAdapter} from "src/adapters/UniswapV2TwapSkewAdapter.sol";
 import {
     MockChainlinkFeed,
     MockERC4626DonationVault,
     MockGovernanceVoteSource,
+    MockReadOnlyReentrancyVault,
     MockReplayClaimLedger,
     MockSpotTwapOracle,
     MockSSVViews
@@ -33,7 +35,7 @@ contract TSI_Findings_Report is Test, TSIBase {
         vm.warp(10_000);
         vm.roll(100);
 
-        TSIFinding[] memory findings = new TSIFinding[](7);
+        TSIFinding[] memory findings = new TSIFinding[](8);
         uint256 index;
 
         AaveFlashLoanOracleAdapter aaveAdapter = new AaveFlashLoanOracleAdapter(AAVE_POOL, WETH, CHAINLINK, A_WETH);
@@ -58,15 +60,15 @@ contract TSI_Findings_Report is Test, TSIBase {
         operatorIds[0] = 11;
         operatorIds[1] = 22;
         ISSVNetworkAdapter.Cluster memory cluster = ISSVNetworkAdapter.Cluster({
-            validatorCount: 3,
-            networkFeeIndex: 7,
-            index: 8,
-            active: true,
-            balance: 100 ether
+            validatorCount: 3, networkFeeIndex: 7, index: 8, active: true, balance: 100 ether
         });
         findings[index++] = buildFinding(
             ssvAdapter,
-            abi.encode(SSVStateContradictionAdapter.SSVContext({owner: address(this), operatorIds: operatorIds, cluster: cluster})),
+            abi.encode(
+                SSVStateContradictionAdapter.SSVContext({
+                    owner: address(this), operatorIds: operatorIds, cluster: cluster
+                })
+            ),
             ssvAdapter.defaultConfidenceScore()
         );
 
@@ -74,6 +76,12 @@ contract TSI_Findings_Report is Test, TSIBase {
         ERC4626DonationPreviewAdapter erc4626Adapter = new ERC4626DonationPreviewAdapter(address(vault));
         erc4626Adapter.executeExploit(abi.encode(100 ether, 400 ether));
         findings[index++] = buildFinding(erc4626Adapter, abi.encode(100 ether), erc4626Adapter.defaultConfidenceScore());
+
+        MockReadOnlyReentrancyVault readOnlyVault = new MockReadOnlyReentrancyVault(1_000 ether, 1_000 ether);
+        ReadOnlyReentrancyAdapter readOnlyAdapter = new ReadOnlyReentrancyAdapter(address(readOnlyVault));
+        readOnlyAdapter.executeExploit(abi.encode(100 ether, 300 ether));
+        findings[index++] =
+            buildFinding(readOnlyAdapter, abi.encode(100 ether), readOnlyAdapter.defaultConfidenceScore());
 
         MockGovernanceVoteSource voteSource = new MockGovernanceVoteSource();
         address voter = address(0xBEEF);
@@ -93,9 +101,7 @@ contract TSI_Findings_Report is Test, TSIBase {
             replayAdapter,
             abi.encode(
                 MerkleReplayClaimAdapter.ClaimContext({
-                    claimId: claimId,
-                    expectedClaimed: false,
-                    expectedExecutionHash: keccak256("expected")
+                    claimId: claimId, expectedClaimed: false, expectedExecutionHash: keccak256("expected")
                 })
             ),
             replayAdapter.defaultConfidenceScore()

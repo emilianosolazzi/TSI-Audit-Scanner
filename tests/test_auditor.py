@@ -182,6 +182,36 @@ class TestToken:
         downcast = [f for f in findings if f.id == "TOKEN-007"]
         assert len(downcast) == 0, "Should NOT flag when using SafeCast"
 
+    def test_no_false_positive_for_bounded_v4_return_delta_cast(self):
+        source = """
+        pragma solidity ^0.8.24;
+        contract SafeHook {
+            error HookFeeExceedsReturnDelta(uint256 fee);
+            uint256 private constant MAX_AFTER_SWAP_RETURN_DELTA = uint256(uint128(type(int128).max));
+
+            function afterSwap(uint256 fee) external pure returns (bytes4, int128) {
+                if (fee > MAX_AFTER_SWAP_RETURN_DELTA) revert HookFeeExceedsReturnDelta(fee);
+                return (this.afterSwap.selector, int128(uint128(fee)));
+            }
+        }
+        """
+        findings = analyze(source)
+        downcast = [f for f in findings if f.id == "TOKEN-007"]
+        assert len(downcast) == 0, "Should NOT flag int128(uint128(x)) after an explicit int128 max bound"
+
+    def test_no_false_positive_for_address_reconstruction_cast(self):
+        source = """
+        pragma solidity ^0.8.24;
+        contract SafeAddressReconstruction {
+            function recover(uint256 rawCurrency) external pure returns (address) {
+                return address(uint160(rawCurrency));
+            }
+        }
+        """
+        findings = analyze(source)
+        downcast = [f for f in findings if f.id == "TOKEN-007"]
+        assert len(downcast) == 0, "Should NOT flag address(uint160(x)) reconstruction as generic unsafe downcast"
+
 
 # ===================================================
 # DENIAL OF SERVICE TESTS
