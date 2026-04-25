@@ -1094,9 +1094,11 @@ class Finding:
     code_snippet: Optional[str] = None
     references: List[str] = field(default_factory=list)
     confidence: float = 1.0  # 0-1 confidence score
+    # ExploitVerifier output (Phase 6 in repo scans, post-filter in on-chain audits)
+    verification: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "id": self.id,
             "severity": self.severity.name,
             "severity_weight": self.severity.weight,
@@ -1109,8 +1111,11 @@ class Finding:
             "function_name": self.function_name,
             "code_snippet": self.code_snippet,
             "references": self.references,
-            "confidence": self.confidence
+            "confidence": self.confidence,
         }
+        if self.verification is not None:
+            d["verification"] = self.verification
+        return d
 
 
 @dataclass
@@ -3766,7 +3771,21 @@ class AdvancedAuditor:
         
         # Post-process findings: filter by confidence and deduplicate
         findings = self._filter_findings(findings, metadata.name)
-        
+
+        # ── Phase 6 (on-chain): exploit verification ────────────────
+        # Same self-calibrating verifier the repo scanner runs in
+        # Phase 6, applied to the on-chain audit findings so that
+        # known-safe shapes (EIP-1967 proxy delegate, FiatToken-style
+        # admin-emergency paths, stateless multicall, etc.) get
+        # auto-downgraded instead of fooling the score.
+        if source_data and source_code:
+            try:
+                findings = self._apply_exploit_verifier(
+                    findings, source_code, metadata,
+                )
+            except Exception as e:
+                logger.warning(f"On-chain exploit verification failed: {e}")
+
         # Calculate scores
         security_score, risk_level, rating_breakdown = self._calculate_scores(
             findings,
@@ -3834,7 +3853,112 @@ class AdvancedAuditor:
         unique.sort(key=lambda f: (severity_rank.get(f.severity, 99), -f.confidence, f.line_number or 10**9))
 
         return unique
-    
+
+    # ════════════════════════════════════════════════════════════════
+    # ON-CHAIN EXPLOIT VERIFIER WIRING
+    # ════════════════════════════════════════════════════════════════
+
+    # severity_adjustment string → target Severity
+    _SEV_ADJUST = {
+        "downgrade_to_INFO": Severity.INFO,
+        "downgrade_to_LOW": Severity.LOW,
+        "downgrade_to_MEDIUM": Severity.MEDIUM,
+        "upgrade_to_MEDIUM": Severity.MEDIUM,
+        "upgrade_to_HIGH": Severity.HIGH,
+        "upgrade_to_CRITICAL": Severity.CRITICAL,
+    }
+
+    def _apply_exploit_verifier(
+        self, findings: List[Finding], source_code: str, metadata: ContractMetadata,
+    ) -> List[Finding]:
+        """Run ExploitVerifier over on-chain findings and apply
+        severity adjustments + verifier metadata in-place.
+
+        Mirrors the Phase 6 wiring in repo_scanner.RepoScanner so that
+        on-chain audits get the same self-calibration (FiatToken-style
+        admin paths, EIP-1967 proxy delegate, stateless multicall, etc.)
+        instead of leaking false-positive CRITICALs into the score.
+        """
+        from exploit_verifier import ExploitVerifier
+        from finding_validator import SolidityParser
+
+        verifier = ExploitVerifier()
+        parser = SolidityParser()
+        try:
+            contracts = parser.parse_file(source_code)
+        except Exception as e:
+            logger.debug(f"verifier: parser failed: {e}")
+            return findings
+        if not contracts:
+            return findings
+
+        # Pick the contract whose source span contains the most flagged
+        # findings (best fallback when there are multiple contracts).
+        primary = contracts[0]
+
+        for f in findings:
+            vid = f.id
+            if vid not in ExploitVerifier.VERIFIER_MAP:
+                continue
+            line = f.line_number or 0
+            func_body = ""
+            for func in primary.functions:
+                if func.line_start <= line <= func.line_end:
+                    func_body = func.body
+                    break
+            if not func_body:
+                func_body = source_code  # whole-source fallback
+
+            try:
+                result = verifier.verify_finding(
+                    finding={
+                        "id": vid,
+                        "line_number": line,
+                        "code_snippet": f.code_snippet or "",
+                        "file": metadata.address,
+                    },
+                    function_body=func_body,
+                    contract_source=source_code,
+                    state_vars=primary.state_variables,
+                    all_functions=primary.functions,
+                )
+            except Exception as e:
+                logger.debug(f"verifier {vid}: {e}")
+                continue
+            if result is None:
+                continue
+
+            # Stamp verifier metadata onto the finding.
+            f.verification = result.to_dict()
+
+            # Apply severity adjustment when the verifier was decisive.
+            adj = result.severity_adjustment
+            if adj and adj in self._SEV_ADJUST:
+                target = self._SEV_ADJUST[adj]
+                if adj.startswith("downgrade_to_"):
+                    if f.severity.weight > target.weight:
+                        f.severity = target
+                        # Lower confidence so the score reflects the
+                        # downgrade signal, not the original pattern.
+                        f.confidence = min(f.confidence, 0.5)
+                elif adj.startswith("upgrade_to_"):
+                    if f.severity.weight < target.weight:
+                        f.severity = target
+                        f.confidence = max(f.confidence, 0.85)
+
+        # Re-sort after adjustments so the consumer sees the stable
+        # order they expect.
+        severity_rank = {
+            Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2,
+            Severity.LOW: 3, Severity.GAS: 4, Severity.INFO: 5,
+        }
+        findings.sort(key=lambda x: (
+            severity_rank.get(x.severity, 99),
+            -x.confidence,
+            x.line_number or 10**9,
+        ))
+        return findings
+
     def _resolve_proxy_implementation(self, address: str) -> Optional[str]:
         """Resolve proxy → implementation address via EIP-1967 / EIP-1822 storage slots.
 

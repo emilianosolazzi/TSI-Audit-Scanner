@@ -342,3 +342,101 @@ def test_swc_107_value_bearing_forwarder_still_confirmed():
         ExploitConfidence.LIKELY,
     }, r.explanation
     assert r.attack_vector != "stateless_forwarder", r.attack_vector
+
+# ──────────────────────────────────────────────────────────────────────
+# On-chain calibration regressions (FiatToken-style + EIP-1967 proxy)
+# ──────────────────────────────────────────────────────────────────────
+
+# (d) PAUSE-001 must DISPROVE on FiatToken-style admin emergency paths
+#     (rescueERC20 onlyRescuer, configureMinter onlyMasterMinter, etc).
+_FIATTOKEN_LIKE = """
+pragma solidity 0.6.12;
+contract FiatTokenV2_2 {
+    bool public paused;
+    address public masterMinter;
+    address public rescuer;
+    modifier whenNotPaused() { require(!paused, "paused"); _; }
+    modifier onlyMasterMinter() { require(msg.sender == masterMinter, "x"); _; }
+    modifier onlyRescuer() { require(msg.sender == rescuer, "x"); _; }
+    function transfer(address to, uint256 v) public whenNotPaused returns (bool) { return true; }
+    function configureMinter(address minter, uint256 cap) external onlyMasterMinter returns (bool) {
+        return true;
+    }
+    function rescueERC20(address tokenContract, address to, uint256 amount) external onlyRescuer {
+        // emergency rescue path — must remain callable while paused.
+    }
+}
+"""
+
+
+def test_pause_001_fiattoken_admin_emergency_path_is_disproven():
+    line = next(
+        i + 1
+        for i, ln in enumerate(_FIATTOKEN_LIKE.splitlines())
+        if "rescueERC20" in ln and "function" in ln
+    )
+    r = _run("PAUSE-001", _FIATTOKEN_LIKE, line_number=line)
+    assert r is not None
+    assert r.exploit_class == ExploitConfidence.DISPROVEN, r.explanation
+    assert r.attack_vector == "admin_emergency_path", r.attack_vector
+
+
+def test_pause_001_fiattoken_minter_admin_path_is_disproven():
+    line = next(
+        i + 1
+        for i, ln in enumerate(_FIATTOKEN_LIKE.splitlines())
+        if "configureMinter" in ln and "function" in ln
+    )
+    r = _run("PAUSE-001", _FIATTOKEN_LIKE, line_number=line)
+    assert r is not None
+    assert r.exploit_class == ExploitConfidence.DISPROVEN, r.explanation
+    assert r.attack_vector == "admin_emergency_path", r.attack_vector
+
+
+# (e) ASM-002 / delegatecall: EIP-1967 proxy delegate is admin-controlled,
+#     must DISPROVE.
+_EIP1967_PROXY = """
+pragma solidity 0.6.12;
+contract FiatTokenProxy {
+    bytes32 private constant IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+    function _implementation() internal view returns (address impl) {
+        bytes32 slot = IMPLEMENTATION_SLOT;
+        assembly { impl := sload(slot) }
+    }
+    fallback() external payable {
+        address _impl = _implementation();
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let result := delegatecall(gas(), _impl, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch result case 0 { revert(0, returndatasize()) } default { return(0, returndatasize()) }
+        }
+    }
+}
+"""
+
+
+def test_asm_002_eip1967_proxy_delegate_is_disproven():
+    line = next(
+        i + 1
+        for i, ln in enumerate(_EIP1967_PROXY.splitlines())
+        if "delegatecall(" in ln
+    )
+    r = _run("ASM-002", _EIP1967_PROXY, line_number=line)
+    assert r is not None
+    assert r.exploit_class == ExploitConfidence.DISPROVEN, r.explanation
+    assert r.attack_vector == "eip1967_proxy_delegate", r.attack_vector
+
+
+# (f) SWC-107 / REENT-GRAPH-001 on the proxy contract itself must
+#     DISPROVE — reentrancy lives in the implementation, not the proxy.
+def test_reent_graph_001_on_proxy_contract_is_disproven():
+    line = next(
+        i + 1
+        for i, ln in enumerate(_EIP1967_PROXY.splitlines())
+        if "delegatecall(" in ln
+    )
+    r = _run("REENT-GRAPH-001", _EIP1967_PROXY, line_number=line)
+    assert r is not None
+    assert r.exploit_class == ExploitConfidence.DISPROVEN, r.explanation
+    assert r.attack_vector == "eip1967_proxy_contract", r.attack_vector

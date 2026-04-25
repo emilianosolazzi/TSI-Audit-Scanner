@@ -86,14 +86,37 @@ cd tsi-audit-scanner
 # Install
 pip install -r requirements.txt
 
-# Configure
+# Configure (only needed for the on-chain auditor / REST API)
 cp .env.example .env
 # Edit .env — set ETHERSCAN_API_KEY at minimum
+```
 
+### Option A — One-click full scan (recommended)
+
+Runs all seven pipeline phases (clone → discover → analyze → validate →
+verify → forge plugin) in a single process and emits JSON / SARIF /
+Markdown side-by-side. See [SCANNER.md](SCANNER.md) for the full guide.
+
+```bash
+# Local repo
+python scan.py path/to/repo
+
+# Public GitHub repo, multi-format output
+python scan.py https://github.com/owner/repo \
+    --out scan_results/run.json \
+    --format json sarif markdown
+
+# Skip Phase 7 (Foundry plugin) when forge isn't installed
+python scan.py path/to/repo --no-forge
+```
+
+### Option B — REST API + scheduler
+
+```bash
 # Run server
 python server.py
 
-# Or scan a repo directly via CLI
+# Or scan a repo via the legacy CLI scheduler
 python scanner_scheduler.py scan https://github.com/owner/repo --scope contracts/
 ```
 
@@ -268,14 +291,36 @@ You can also run this hands-off in GitHub Actions via `.github/workflows/intelli
 ## Architecture
 
 ```
+scan.py                   One-click CLI — runs the full 7-phase pipeline
 server.py                 Flask API — 15 endpoints, rate limiting, tiered access
 config.py                 Environment config, 7 chains, 3 pricing tiers
 advanced_auditor.py       Core engine — 80+ vuln patterns, consistency auditor (TSI),
                           protection-first detection, multi-chain Etherscan
-repo_scanner.py           Git clone → file discovery → pattern analysis → consistency checks
+repo_scanner.py           Phase 1-7 orchestrator: clone, discover, analyze (parallel),
+                          validate, verify, forge plugin
+novel_analyzers.py        CryptoAccessControlAnalyzer (CRYPTO-IDM/MAL/CTX/RPL),
+                          guard-dominance, selector / storage-slot collisions
+finding_validator.py      Triage findings into confirm_first / needs_context / likely_noise
+exploit_verifier.py       Algebraic verifiers per VERIFIER_MAP entry; emits CONFIRMED /
+                          LIKELY / CONDITIONAL / INCONCLUSIVE / DISPROVEN dispositions
+report_generator.py       JSON / SARIF v2.1.0 / Markdown emitters
 source_analyzer.py        solc/forge compilation, AST extraction, call graphs
 scanner_scheduler.py      SQLite targets/history, continuous poll loop, CLI
+forge/                    Foundry TSI plugin harness (Phase 7 adapters)
+tests/                    Pytest regression suite (one fixture per VERIFIER_MAP entry)
 ```
+
+### Seven-phase pipeline (`scan.py` / `RepoScanner.scan_repo`)
+
+| # | Phase | What it does |
+|---|-------|--------------|
+| 1 | Clone / locate | git clone the URL or use the local path as-is |
+| 2 | Detect framework | foundry / hardhat / brownie / truffle, plus remappings |
+| 3 | Discover sources | recursive walk; skips `node_modules`, `.git`, `cache`, `out`, `artifacts`, `lib`; strips test/script files unless `--include-tests` |
+| 4 | Analyze (parallel) | 80+ pattern detectors + `CryptoAccessControlAnalyzer` + project-wide novel passes (selector / storage-slot collisions) |
+| 5 | Validate | `FindingValidator` triages every raw finding and dedupes |
+| 6 | Verify | `ExploitVerifier` runs the algebraic check defined in `VERIFIER_MAP` and assigns CONFIRMED / LIKELY / CONDITIONAL / INCONCLUSIVE / DISPROVEN |
+| 7 | Foundry plugin | (optional) invokes `./forge` `TSI_Findings_Report` test and merges runtime adapter findings |
 
 ### Consistency Auditor (advanced_auditor.py)
 
@@ -293,6 +338,7 @@ The pattern engine covers:
 | Category | Examples |
 |----------|----------|
 | **Consistency (TSI)** | Callback state exposure, CEI violations, oracle temporal inconsistency, access control contradictions |
+| **Cryptographic access control** | `CRYPTO-IDM-001` (truncated identity hash), `CRYPTO-MAL-001` (ECDSA s-malleability), `CRYPTO-CTX-001` (missing chainId / verifyingContract domain), `CRYPTO-RPL-001` (signature replay / missing nonce) |
 | Reentrancy | State after external call, cross-function, read-only |
 | Access Control | Missing modifiers, unprotected selfdestruct, tx.origin |
 | Oracle | Price manipulation, stale data, single-source dependency |
@@ -300,6 +346,27 @@ The pattern engine covers:
 | MEV | Sandwich vectors, front-running exposure |
 | Arithmetic | Unchecked math, precision loss, rounding |
 | DeFi-specific | Slippage, donation attacks, fee-on-transfer |
+
+### Verifier dispositions
+
+The Phase 6 `ExploitVerifier` doesn't just keep or drop findings — it
+assigns each candidate an `exploit_class` so the consumer can gate on
+algebraically-confirmed bugs:
+
+| Class | Meaning |
+|-------|---------|
+| `CONFIRMED` | Algebraically guaranteed exploit conditions met. Triage first. |
+| `LIKELY` | High probability, one minor assumption open. Manual review. |
+| `CONDITIONAL` | Exploitable only under specific preconditions (off-chain integration, market state, caller). |
+| `INCONCLUSIVE` | Verifier could not decide. Treat as a normal severity-tiered finding. |
+| `DISPROVEN` | Verifier proved the candidate is not exploitable in this code shape. Auto-noise. |
+
+The verifier is **self-calibrating** — known false-positive shapes are
+encoded as protection checks (e.g., `permit` style malleability is
+auto-downgraded to `CONDITIONAL` when the function consumes an
+in-contract nonce in the same body; reentrancy on stateless
+Multicall-style forwarders is auto-classified `DISPROVEN`).
+All calibrations are covered by `tests/test_verifier_regression.py`.
 
 ### Consistency Auditor (TSI) Details
 
