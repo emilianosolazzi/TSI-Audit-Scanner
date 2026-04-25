@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source
 COPY server.py config.py advanced_auditor.py \
     repo_scanner.py source_analyzer.py scanner_scheduler.py \
-    report_generator.py \
+    report_generator.py env_loader.py \
      ./
 
 # Create directories for scanner workspace and results
