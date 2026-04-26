@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 _SUMMARY_RE = re.compile(r"(?P<passed>\d+) passed; (?P<failed>\d+) failed; (?P<skipped>\d+) skipped")
 _FINDINGS_REPORT_CONTRACT = "TSI_Findings_Report"
+_DEFAULT_FINDINGS_ARTIFACT = "artifacts/tsi_adapter_findings.json"
 
 
 def _utc_now() -> str:
@@ -81,6 +82,8 @@ def run_tsi_plugin(
     plugin_dir: Path,
     fork_url: str | None,
     match_contract: str,
+    findings_contract: str | None = None,
+    findings_artifact: str = _DEFAULT_FINDINGS_ARTIFACT,
 ) -> Dict[str, Any]:
     outdir.mkdir(parents=True, exist_ok=True)
     resolved_plugin_dir = plugin_dir if plugin_dir.is_absolute() else (root_dir / plugin_dir)
@@ -92,6 +95,8 @@ def run_tsi_plugin(
         "plugin_dir": str(resolved_plugin_dir),
         "status": "not_run",
         "match_contract": match_contract,
+        "findings_contract": findings_contract or match_contract,
+        "findings_artifact": findings_artifact,
     }
 
     if not resolved_plugin_dir.exists():
@@ -105,7 +110,7 @@ def run_tsi_plugin(
         cmd = ["forge", "test", "--match-contract", match_contract, "-vv"]
         if fork_url:
             cmd.extend(["--fork-url", fork_url])
-        findings_artifact_path = resolved_plugin_dir / "artifacts" / "tsi_adapter_findings.json"
+        findings_artifact_path = resolved_plugin_dir / findings_artifact
         if findings_artifact_path.exists():
             findings_artifact_path.unlink()
 
@@ -133,8 +138,15 @@ def run_tsi_plugin(
                 else:
                     result["status"] = "failed"
 
-            findings_cmd = ["forge", "test", "--match-contract", _FINDINGS_REPORT_CONTRACT, "-vv"]
-            findings_proc, findings_output, findings_counts = _run_forge_command(findings_cmd, resolved_plugin_dir)
+            selected_findings_contract = findings_contract or match_contract
+            findings_cmd = ["forge", "test", "--match-contract", selected_findings_contract, "-vv"]
+            same_contract_for_status_and_findings = selected_findings_contract == match_contract
+            if same_contract_for_status_and_findings:
+                findings_proc = proc
+                findings_output = combined_output
+                findings_counts = counts
+            else:
+                findings_proc, findings_output, findings_counts = _run_forge_command(findings_cmd, resolved_plugin_dir)
             result["findings_report"] = {
                 "command": findings_cmd,
                 "return_code": findings_proc.returncode,
@@ -149,7 +161,7 @@ def run_tsi_plugin(
                 result["status"] = "failed"
                 result["findings_status"] = "failed"
             elif findings_artifact_path.exists():
-                copied_findings_path = outdir / "tsi_adapter_findings.json"
+                copied_findings_path = outdir / findings_artifact_path.name
                 shutil.copyfile(findings_artifact_path, copied_findings_path)
                 findings_payload = json.loads(copied_findings_path.read_text(encoding="utf-8"))
                 findings = list(findings_payload.get("findings") or [])
@@ -160,6 +172,10 @@ def run_tsi_plugin(
                 result["normalized_findings"] = [_normalize_forge_finding(finding) for finding in findings]
             else:
                 result["findings_status"] = "missing"
+                result["findings_warning"] = (
+                    f"No findings artifact was emitted at '{findings_artifact}' by contract "
+                    f"'{selected_findings_contract}'."
+                )
 
             log_path = outdir / "tsi_plugin_test_output.log"
             log_path.write_text(combined_output, encoding="utf-8", errors="replace")
@@ -195,6 +211,19 @@ def main() -> None:
         default="TSI_Aave_FlashLoan_Oracle",
         help="Foundry --match-contract target for TSI plugin",
     )
+    parser.add_argument(
+        "--tsi-findings-contract",
+        default=None,
+        help=(
+            "Contract to emit structured findings JSON. "
+            f"Defaults to --tsi-match-contract; set {_FINDINGS_REPORT_CONTRACT} for legacy behavior."
+        ),
+    )
+    parser.add_argument(
+        "--tsi-findings-artifact",
+        default=_DEFAULT_FINDINGS_ARTIFACT,
+        help="Relative path (inside plugin dir) to structured findings JSON artifact",
+    )
     args = parser.parse_args()
 
     root_dir = Path(__file__).resolve().parents[1]
@@ -204,6 +233,8 @@ def main() -> None:
         plugin_dir=Path(args.tsi_plugin_dir),
         fork_url=args.tsi_fork_url,
         match_contract=args.tsi_match_contract,
+        findings_contract=args.tsi_findings_contract,
+        findings_artifact=args.tsi_findings_artifact,
     )
 
     print(

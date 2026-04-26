@@ -38,13 +38,46 @@ Classify findings with **where and how** they matter:
 
 *What others do:* Flag "oracle manipulation" as MEDIUM. We classify severity based on **exploitability in actual execution**.
 
-### 5. **Differential Code Analysis**
+### 5. **Spec-Implementation Contradiction (SIC)**
+Detect contradictions across administrative and operational paths where `D(spec) ≠ D(impl)`:
+- Parse documentation for explicit capability claims (e.g., `address(0)` disables X, `deactivate()` stops Y)
+- Trace the corresponding implementation path and reachability
+- Flag where the documented path is structurally unreachable or contradicts the codebase
+
+*What others do:* Rely entirely on humans to read the spec and compare it to the code. We begin bridging NLP documentation extraction with reachability analysis.
+
+### 6. **Differential Code Analysis**
 Hunt for vulnerabilities in newer code paths post-audit:
 - Identify audit checkpoints (prior audits, test coverage)
 - Flag novel surfaces (initialization, upgrade paths, new token mechanics)
 - Prefer bounded fuzzing over speculation
 
 *What others do:* Re-audit everything. We focus on delta risk.
+
+### 7. **Dead Code Reachability Validator (DCR)**
+Flag defensive checks, modifiers, or guards that can never be reached given the current setter/initializer logic:
+- `DCR: code_path(P) is reachable ↔ ∃ execution_trace T such that T reaches P`
+- Catches entire classes of "designed but impossible" safety mechanisms (like `_checkWhitelist` bypassing on `address(0)` while `_setWhitelist` reverts).
+
+### 8. **Emergency Path Coverage (EPC) pass**
+A specialized audit pass isolating emergency and recovery functions:
+- Explicit checks for `pause()`, `unpause()`, `deactivate()`, `emergencyWithdraw()`, and `setX(address(0))`.
+- Verifies realistic execution paths against the current environment state.
+- *Why:* Emergency functions are disproportionately likely to be broken since they are rarely tested and often bolted on late.
+
+### 9. **Governance Timelock Gap Analysis (GTGA)**
+Directly feeds into severity scoring by quantifying the time delta introduced by a broken emergency path:
+- `impact_window = recovery_time(with_bug) - recovery_time(without_bug)`
+- Without a native escape hatch, recovery might require an arbitrary proxy upgrade through a 48-hour timelock, functionally elevating the exploit window by 48 hours.
+
+### 10. **Documentation Coverage Score (DCS)**
+Heuristic calculation mapping `DCS = |documented_capabilities| / |verified_reachable_capabilities|`.
+A ratio below 1.0 flags the protocol for high-priority manual review, as certain documented capabilities are structurally unimplementable.
+
+### 11. **Initializer State Assumption Validator (ISAV)**
+Validates that every state assumption made in modifiers and guards is actually established somewhere in the initialization path:
+- `ISAV: ∀ state_assumption A in modifier M, ∃ initializer I such that I guarantees A`
+- Catches cases where a modifier assumes a condition (like `whitelist != address(0)`), but nothing in the contract lifecycle ever guarantees it was properly set up.
 
 ---
 
@@ -56,6 +89,7 @@ Hunt for vulnerabilities in newer code paths post-audit:
 | On-chain audit | ✓ | ✗ | ✗ | ✓ | ✓ |
 | Repo scanning | ✓ | ✓ | ✗ | ✓ | ✗ |
 | Consistency detection | **✓** | ✗ | ✗ | Partial | ✗ |
+| Spec-Impl Contradiction (SIC) | **✓** | ✗ | ✗ | ✗ | ✗ |
 | Protection-first | **✓** | ✗ | ✗ | ✗ | ~ |
 | Execution context | **✓** | ✗ | Partial | Partial | Partial |
 | Multi-chain | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -68,6 +102,7 @@ Hunt for vulnerabilities in newer code paths post-audit:
 ## Features
 
 - **Consistency Auditor** — Detect state contradictions across callback, reentrancy, oracle, and access control contexts
+- **Spec-Implementation Contradiction (SIC)** — Verify `D(spec) = D(impl)` across documented administrative workflows and code reachability
 - **On-chain audit** — Fetch source from 7 block explorer APIs, run 80+ vulnerability patterns
 - **Repo scanning** — Clone public/private GitHub repos, discover Solidity files, analyze
 - **Pattern engine** — Protection-first: checks for guards before flagging (reentrancy, access control, oracle, flash loan, MEV, front-running, arithmetic)
@@ -284,12 +319,17 @@ python scripts/intelligent_e2e_flow.py \
   --outdir speed_tests/automation \
   --tsi-plugin-dir forge \
   --tsi-match-contract TSI_Aave_FlashLoan_Oracle \
+  --tsi-findings-contract TSI_Aave_FlashLoan_Oracle \
   --tsi-fork-url "$ETH_RPC_URL" \
   --tsi-enforce-pass
 ```
 
+- By default, structured findings are read from the same contract provided to `--tsi-match-contract`.
+- Set `--tsi-findings-contract TSI_Findings_Report` to keep legacy generic adapter findings.
+- Set `--tsi-findings-artifact <relative/path.json>` if your custom harness writes findings to a non-default artifact path.
 - Without `--tsi-fork-url`, the plugin runs in local mode and safely reports `skipped` when fork-only tests cannot execute.
 - With `--tsi-enforce-pass`, the pipeline fails unless the TSI plugin status is `pass`.
+- Intelligent E2E now runs the plugin in a dedicated post-report step, so scanner-side Phase 7 findings are not double-counted in `full_e2e_report.json`.
 
 If you post-process an existing scan in a different output folder, pass the original workspace so semantic continuation can still run:
 

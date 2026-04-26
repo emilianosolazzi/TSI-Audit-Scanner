@@ -234,6 +234,26 @@ def main() -> None:
     parser.add_argument("--outdir", default="speed_tests/scroll_usx", help="Output directory")
     parser.add_argument("--branch", default="main", help="Git branch")
     parser.add_argument("--workspace-dir", help="Optional existing workspace directory for source loading")
+    parser.add_argument(
+        "--no-forge-plugin",
+        action="store_true",
+        help="Skip RepoScanner Phase 7 Forge plugin during base scan",
+    )
+    parser.add_argument(
+        "--forge-plugin-dir",
+        default=None,
+        help="Override path to the Foundry TSI plugin harness when Phase 7 is enabled",
+    )
+    parser.add_argument(
+        "--forge-match-contract",
+        default="TSI_Findings_Report",
+        help="Forge --match-contract for RepoScanner Phase 7 when enabled",
+    )
+    parser.add_argument(
+        "--forge-fork-url",
+        default=None,
+        help="Optional fork RPC URL for RepoScanner Phase 7 when enabled",
+    )
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -245,7 +265,14 @@ def main() -> None:
         if not args.url:
             raise SystemExit("Either --url or --input-scan must be provided")
         scanner = RepoScanner(workspace_dir=str(outdir / "workspace"))
-        result = scanner.scan_repo(args.url, branch=args.branch)
+        result = scanner.scan_repo(
+            args.url,
+            branch=args.branch,
+            run_forge_plugin=not args.no_forge_plugin,
+            forge_plugin_dir=args.forge_plugin_dir,
+            forge_match_contract=args.forge_match_contract,
+            forge_fork_url=args.forge_fork_url,
+        )
         scan_data = result.to_dict()
         (outdir / "scan_result_full.json").write_text(json.dumps(scan_data, indent=2), encoding="utf-8")
 

@@ -94,6 +94,12 @@ class Category(Enum):
     GAS = "Gas Optimization"
     CODE_QUALITY = "Code Quality"
     TSI_CALLBACK = "Temporal State Inconsistency"
+    SIC = "Spec-Impl Contradiction"
+    DCR = "Dead Code Reachability"
+    EPC = "Emergency Path Coverage"
+    GTGA = "Governance Timelock Gap Analysis"
+    DCS = "Documentation Coverage Score"
+    ISAV = "Initializer State Assumption Validator"
     ASSEMBLY = "Inline Assembly"
     GOVERNANCE = "Governance"
     ERC_COMPLIANCE = "ERC Compliance"
@@ -145,6 +151,9 @@ PROTECTION_PATTERNS = {
         r"require\s*\(\s*!locked",
         r"reentrancyGuardEntered",
         r"_reentrancyGuardEntered",
+    ],
+    "sic_reachability": [
+        r"(?:if|require)\s*\([^)=]*!=\s*address\(0\)\)",
     ],
     # TSI (Temporal State Inconsistency) protections
     "tsi_callback": [
@@ -921,6 +930,43 @@ KNOWN_VULNERABILITIES = {
         "recommendation": "Store state snapshot before cross-chain send. Validate received callback against stored snapshot, not live state.",
         "protection_check": "tsi_callback"
     },
+    
+    # ===========================================
+    # SPEC-IMPLEMENTATION CONTRADICTIONS (SIC)
+    # ===========================================
+    "SIC-001": {
+        "name": "Documented Zero-Address Escape Hatch Unreachable",
+        "severity": Severity.MEDIUM,
+        "category": Category.SIC,
+        "pattern": r"function\s+_\w*(?:Set\w*|Update\w*)\s*\([^)]+\w+\s+(new\w+|target\w+|_[a-zA-Z]+)\)\s*[^{]*\{[^}]*(?:\.\w+Access\(\)|\.\w+Enabled\(\)).*\}",
+        "description": "Function attempts a high-level struct interaction or validity check (.isAccess(), etc.) on a new parameter before checking if it is address(0). This causes EVM reverting if address(0) is intended as an emergency escape/disable hatch.",
+        "recommendation": "Use `if (param != address(0))` to wrap any contract-level method calls when the zero-address is intended as a legitimate protocol state (like disabling a whitelist).",
+        "protection_check": "sic_reachability",
+        "reference": "CapyFi Whitelist Deactivation Bug"
+    },
+    
+    # ===========================================
+    # NEW ADVANCED COVERAGE ANALYZERS
+    # ===========================================
+    "EPC-001": {
+        "name": "Isolated Emergency Function Exists",
+        "severity": Severity.INFO,
+        "category": Category.EPC,
+        "pattern": r"function\s+(?:pause|unpause|deactivate|disable|emergencyWithdraw|eject)\s*\(",
+        "description": "Identifies the presence of emergency fallback functions. Requires manual capability verification or reachability test to ensure these are actually executable under emergency constraints.",
+        "recommendation": "Verify tests invoke this emergency path when the primary invariant fails.",
+        "protection_check": "none"
+    },
+    "ISAV-001": {
+        "name": "Modifier State Assumption",
+        "severity": Severity.INFO,
+        "category": Category.ISAV,
+        "pattern": r"modifier\s+\w+\s*\([^)]*\)\s*\{[^}]*require\s*\([^)]*\s*!=\s*address\(0\)",
+        "description": "Modifier assumes a state variable is never address(0). Ensure the initializer actually guarantees this variable is populated and cannot be zeroed out improperly by setters.",
+        "recommendation": "Validate `address(0)` checks exist in all constructors and setters referencing this assumed state.",
+        "protection_check": "none"
+    },
+
     # ===========================================
     # ORACLE MANIPULATION PATTERNS
     # (ORACLE-MANIP-001/002/003 are handled by _analyze_oracle_patterns()

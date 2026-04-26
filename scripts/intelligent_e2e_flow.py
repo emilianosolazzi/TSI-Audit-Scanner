@@ -33,6 +33,7 @@ def _run_full_e2e_report(
     branch: str,
     input_scan: Path | None,
     workspace_dir: Path | None,
+    no_forge_plugin: bool,
 ) -> None:
     cmd: List[str] = [
         sys.executable,
@@ -52,6 +53,10 @@ def _run_full_e2e_report(
 
     if workspace_dir is not None:
         cmd.extend(["--workspace-dir", str(workspace_dir)])
+
+    if no_forge_plugin:
+        # Intelligent flow runs the plugin in a dedicated step after base report generation.
+        cmd.append("--no-forge-plugin")
 
     subprocess.run(cmd, check=True, cwd=str(root_dir))
 
@@ -165,6 +170,7 @@ def _render_markdown(summary: Dict[str, Any]) -> str:
         "",
         f"- Status: {summary.get('tsi_plugin', {}).get('status', 'not_run')}",
         f"- Contract: {summary.get('tsi_plugin', {}).get('match_contract', 'n/a')}",
+        f"- Findings contract: {summary.get('tsi_plugin', {}).get('findings_contract', 'n/a')}",
         f"- Plugin dir: {summary.get('tsi_plugin', {}).get('plugin_dir', 'n/a')}",
         f"- Result JSON: {summary.get('tsi_plugin', {}).get('result_path', 'n/a')}",
         f"- Output log: {summary.get('tsi_plugin', {}).get('log_path', 'n/a')}",
@@ -260,6 +266,19 @@ def main() -> None:
         help="Foundry --match-contract target for TSI plugin",
     )
     parser.add_argument(
+        "--tsi-findings-contract",
+        default=None,
+        help=(
+            "Contract to emit structured findings JSON. "
+            "Defaults to --tsi-match-contract; set TSI_Findings_Report for legacy adapter output."
+        ),
+    )
+    parser.add_argument(
+        "--tsi-findings-artifact",
+        default="artifacts/tsi_adapter_findings.json",
+        help="Relative path (inside plugin dir) to structured findings JSON artifact",
+    )
+    parser.add_argument(
         "--tsi-enforce-pass",
         action="store_true",
         help="Fail the pipeline when the TSI plugin status is not pass",
@@ -284,6 +303,7 @@ def main() -> None:
         branch=args.branch,
         input_scan=input_scan,
         workspace_dir=workspace_dir,
+        no_forge_plugin=True,
     )
 
     report_json_path = outdir / "full_e2e_report.json"
@@ -297,6 +317,8 @@ def main() -> None:
         plugin_dir=Path(args.tsi_plugin_dir),
         fork_url=args.tsi_fork_url,
         match_contract=args.tsi_match_contract,
+        findings_contract=args.tsi_findings_contract,
+        findings_artifact=args.tsi_findings_artifact,
     )
 
     forge_findings = list(tsi_plugin.get("normalized_findings") or [])

@@ -23,6 +23,26 @@ on:
         description: Gate limit for HIGH findings in needs_manual_review
         required: true
         default: "3"
+      tsi_plugin_dir:
+        description: Path to Foundry TSI plugin harness
+        required: true
+        default: forge
+      tsi_match_contract:
+        description: Forge match-contract for plugin status run
+        required: true
+        default: TSI_Aave_FlashLoan_Oracle
+      tsi_findings_contract:
+        description: Contract that emits structured findings JSON (blank = same as tsi_match_contract)
+        required: false
+        default: ""
+      tsi_findings_artifact:
+        description: Relative findings artifact path inside plugin dir
+        required: true
+        default: artifacts/tsi_adapter_findings.json
+      tsi_fork_url:
+        description: Optional fork RPC URL for plugin runtime checks
+        required: false
+        default: ""
   schedule:
     - cron: "30 3 * * *"
 
@@ -50,7 +70,12 @@ jobs:
             --outdir speed_tests/automation \
             --max-confirmed-true "${{ github.event.inputs.max_confirmed_true || '0' }}" \
             --max-critical-manual "${{ github.event.inputs.max_critical_manual || '0' }}" \
-            --max-high-manual "${{ github.event.inputs.max_high_manual || '3' }}"
+            --max-high-manual "${{ github.event.inputs.max_high_manual || '3' }}" \
+            --tsi-plugin-dir "${{ github.event.inputs.tsi_plugin_dir || 'forge' }}" \
+            --tsi-match-contract "${{ github.event.inputs.tsi_match_contract || 'TSI_Aave_FlashLoan_Oracle' }}" \
+            --tsi-findings-contract "${{ github.event.inputs.tsi_findings_contract || '' }}" \
+            --tsi-findings-artifact "${{ github.event.inputs.tsi_findings_artifact || 'artifacts/tsi_adapter_findings.json' }}" \
+            --tsi-fork-url "${{ github.event.inputs.tsi_fork_url || '' }}"
 
       - name: Add summary to workflow output
         if: always()

@@ -42,6 +42,8 @@ def main() -> None:
     e2e.add_argument("--tsi-plugin-dir", default="forge")
     e2e.add_argument("--tsi-fork-url")
     e2e.add_argument("--tsi-match-contract", default="TSI_Aave_FlashLoan_Oracle")
+    e2e.add_argument("--tsi-findings-contract", default=None)
+    e2e.add_argument("--tsi-findings-artifact", default="artifacts/tsi_adapter_findings.json")
     e2e.add_argument("--tsi-enforce-pass", action="store_true")
 
     plugin = subparsers.add_parser("plugin", help="Run tsi_plugin_runner.py")
@@ -49,6 +51,8 @@ def main() -> None:
     plugin.add_argument("--tsi-plugin-dir", default="forge")
     plugin.add_argument("--tsi-fork-url")
     plugin.add_argument("--tsi-match-contract", default="TSI_Aave_FlashLoan_Oracle")
+    plugin.add_argument("--tsi-findings-contract", default=None)
+    plugin.add_argument("--tsi-findings-artifact", default="artifacts/tsi_adapter_findings.json")
 
     benchmark = subparsers.add_parser("benchmark", help="Run benchmark corpus")
     benchmark.add_argument("--corpus", default="tests/benchmark_corpus", help="Path to benchmark corpus directory")
@@ -75,6 +79,8 @@ def main() -> None:
     all_cmd.add_argument("--tsi-plugin-dir", default="forge")
     all_cmd.add_argument("--tsi-fork-url")
     all_cmd.add_argument("--tsi-match-contract", default="TSI_Aave_FlashLoan_Oracle")
+    all_cmd.add_argument("--tsi-findings-contract", default=None)
+    all_cmd.add_argument("--tsi-findings-artifact", default="artifacts/tsi_adapter_findings.json")
     all_cmd.add_argument("--tsi-enforce-pass", action="store_true")
 
     args = parser.parse_args()
@@ -114,7 +120,11 @@ def main() -> None:
             args.tsi_plugin_dir,
             "--tsi-match-contract",
             args.tsi_match_contract,
+            "--tsi-findings-artifact",
+            args.tsi_findings_artifact,
         ]
+        if args.tsi_findings_contract:
+            cmd.extend(["--tsi-findings-contract", args.tsi_findings_contract])
         if args.input_scan:
             cmd.extend(["--input-scan", args.input_scan])
         elif args.url:
@@ -135,7 +145,11 @@ def main() -> None:
             args.tsi_plugin_dir,
             "--tsi-match-contract",
             args.tsi_match_contract,
+            "--tsi-findings-artifact",
+            args.tsi_findings_artifact,
         ]
+        if args.tsi_findings_contract:
+            cmd.extend(["--tsi-findings-contract", args.tsi_findings_contract])
         if args.tsi_fork_url:
             cmd.extend(["--tsi-fork-url", args.tsi_fork_url])
         raise SystemExit(_run(cmd, root_dir))
@@ -197,7 +211,11 @@ def main() -> None:
             args.tsi_plugin_dir,
             "--tsi-match-contract",
             args.tsi_match_contract,
+            "--tsi-findings-artifact",
+            args.tsi_findings_artifact,
         ]
+        if args.tsi_findings_contract:
+            e2e_cmd.extend(["--tsi-findings-contract", args.tsi_findings_contract])
         if args.input_scan:
             e2e_cmd.extend(["--input-scan", args.input_scan])
         elif args.url:
