@@ -1122,6 +1122,87 @@ class StateContradiction:
 
 
 # ===================================================
+# VULNERABILITY SCORING (V × C × S)
+# ===================================================
+# Vulnerability Score = Value Extraction Path (V) × Chaining Feasibility (C) × Solodit Precedent Multiplier (S)
+#
+#   V  : 0=no value at risk, 1=funds/tokens can be extracted/inflated/frozen
+#   C  : 0=impossible, 0.5=needs rare state, 1=trivially chainable in one block
+#   S  : 1.0=novel, 1.5=similar Solodit finding, 2.5=carbon-copy of a critical exploit
+#
+# Max score = 2.5  (V=1, C=1, S=2.5)
+# Findings are sorted by vuln_score to produce an attacker-eye priority queue.
+
+VULN_SCORE_TABLE: Dict[str, Tuple[float, float, float]] = {
+    # (V, C, S)  →  score = V * C * S
+    # ─── Reentrancy ───────────────────────────────────────────────────────────
+    "SWC-107":        (1, 1.0, 2.5),   # 2.50  classic re-entrancy, #1 Solodit
+    "ERC-721":        (1, 1.0, 2.5),   # 2.50  ERC-721 callback re-entrancy
+    "TOKEN-005":      (1, 1.0, 2.5),   # 2.50  ERC-777 hook re-entrancy
+    # ─── Arithmetic ───────────────────────────────────────────────────────────
+    "SWC-101":        (1, 0.5, 1.5),   # 0.75  overflow/underflow (pre-0.8)
+    "TOKEN-007":      (1, 0.5, 1.5),   # 0.75  unsafe downcast → balance corruption
+    "VALIDATE-002":   (1, 1.0, 2.5),   # 2.50  msg.value in loop → double-count ETH
+    # ─── Access control / selfdestruct ────────────────────────────────────────
+    "SWC-106":        (1, 0.5, 1.5),   # 0.75  selfdestruct loses funds
+    "SWC-115":        (1, 0.5, 1.5),   # 0.75  tx.origin phishing
+    "ACCESS-001":     (1, 0.5, 1.5),   # 0.75  missing access control
+    "UPGRADE-AUTH-001":(1, 0.5, 1.5),  # 0.75  EOA-held admin → proxy upgrade
+    # ─── Proxy / initialization ───────────────────────────────────────────────
+    "PROXY-001":      (1, 0.5, 2.5),   # 1.25  uninitialized proxy takeover
+    "ASM-002":        (1, 0.5, 1.5),   # 0.75  delegatecall to untrusted target
+    "INIT-001":       (1, 1.0, 2.5),   # 2.50  front-runnable init (MEV)
+    "INIT-002":       (1, 1.0, 2.5),   # 2.50  front-runnable init (race)
+    "INIT-003":       (1, 0.5, 1.5),   # 0.75  nullified initializer
+    # ─── Signatures ───────────────────────────────────────────────────────────
+    "SIG-001":        (1, 1.0, 2.5),   # 2.50  ecrecover(0) → signature forgery
+    "SIG-002":        (1, 0.5, 2.5),   # 1.25  replay attack
+    "SIG-003":        (1, 0.5, 1.5),   # 0.75  signature malleability
+    # ─── DeFi / oracle / MEV ─────────────────────────────────────────────────
+    "DEFI-001":       (1, 1.0, 2.5),   # 2.50  flash loan vulnerability
+    "DEFI-002":       (1, 1.0, 2.5),   # 2.50  price oracle manipulation
+    "DEFI-003":       (1, 1.0, 1.5),   # 1.50  sandwich (zero slippage)
+    "DEFI-004":       (1, 0.5, 1.5),   # 0.75  missing slippage protection
+    # ─── Token ────────────────────────────────────────────────────────────────
+    "TOKEN-002":      (1, 0.5, 2.5),   # 1.25  ERC-4626 inflation attack
+    "TOKEN-003":      (1, 0.5, 1.5),   # 0.75  fee-on-transfer accounting
+    # ─── TSI / cross-chain callbacks ─────────────────────────────────────────
+    "TSI-001":        (1, 1.0, 1.5),   # 1.50  sgReceive state read
+    "TSI-002":        (1, 1.0, 1.5),   # 1.50  uniswap callback state read
+    "TSI-003":        (1, 0.5, 1.5),   # 0.75  lzReceive state read
+    "TSI-004":        (1, 1.0, 1.5),   # 1.50  LP collateral during callback
+    "TSI-005":        (1, 0.5, 1.5),   # 0.75  cross-chain callback pool query
+    # ─── DoS ──────────────────────────────────────────────────────────────────
+    "DOS-001":        (0, 0.5, 1.5),   # 0.00  unbounded loop DoS (no extraction)
+    "DOS-002":        (0, 0.5, 1.5),   # 0.00  external call in loop DoS
+    # ─── Governance ───────────────────────────────────────────────────────────
+    "GOV-001":        (1, 1.0, 2.5),   # 2.50  flash loan governance attack
+    # ─── Uniswap v4 hook patterns ─────────────────────────────────────────────
+    "HOOK-001":       (1, 1.0, 1.5),   # 1.50  global hook state contaminated cross-pool
+    "HOOK-002":       (1, 1.0, 2.5),   # 2.50  fee currency-unit mismatch (cross-decimal DoS)
+}
+
+# Severity-based fallback when vuln_id is not in the table
+_SEVERITY_FALLBACK: Dict[str, Tuple[float, float, float]] = {
+    "CRITICAL": (1, 0.5, 1.0),   # 0.50
+    "HIGH":     (1, 0.5, 1.0),   # 0.50
+    "MEDIUM":   (0, 0.5, 1.0),   # 0.00
+    "LOW":      (0, 0.0, 1.0),   # 0.00
+    "INFO":     (0, 0.0, 1.0),   # 0.00
+    "GAS":      (0, 0.0, 1.0),   # 0.00
+}
+
+
+def compute_vuln_score(vuln_id: str, severity: "Severity") -> float:
+    """Return V × C × S for a finding.  Range 0.0 – 2.5."""
+    if vuln_id in VULN_SCORE_TABLE:
+        v, c, s = VULN_SCORE_TABLE[vuln_id]
+    else:
+        v, c, s = _SEVERITY_FALLBACK.get(severity.name, (0, 0, 1.0))
+    return round(v * c * s, 2)
+
+
+# ===================================================
 # DATA STRUCTURES
 # ===================================================
 
@@ -1140,6 +1221,7 @@ class Finding:
     code_snippet: Optional[str] = None
     references: List[str] = field(default_factory=list)
     confidence: float = 1.0  # 0-1 confidence score
+    vuln_score: float = 0.0   # V × C × S attacker-priority score (0.0–2.5)
     # ExploitVerifier output (Phase 6 in repo scans, post-filter in on-chain audits)
     verification: Optional[Dict[str, Any]] = None
     
@@ -1158,6 +1240,7 @@ class Finding:
             "code_snippet": self.code_snippet,
             "references": self.references,
             "confidence": self.confidence,
+            "vuln_score": self.vuln_score,
         }
         if self.verification is not None:
             d["verification"] = self.verification
@@ -1322,7 +1405,7 @@ class ChainClient:
     }
     
     PUBLIC_RPCS = {
-        "ethereum": "https://eth.llamarpc.com",
+        "ethereum": "https://ethereum-rpc.publicnode.com",
         "arbitrum": "https://arb1.arbitrum.io/rpc",
         "polygon": "https://polygon-rpc.com",
         "bsc": "https://bsc-dataseed.binance.org",
@@ -1463,6 +1546,15 @@ class ChainClient:
                 return val
         return self._rpc_call("eth_call", [{"to": address, "data": selector}, "latest"])
 
+    def call_function_data(self, address: str, calldata: str) -> Optional[str]:
+        """Call view function with full calldata via eth_call, falling back to direct RPC."""
+        data = self._request("proxy", "eth_call", to=address, data=calldata, tag="latest")
+        if "result" in data and not data.get("error"):
+            val = data["result"]
+            if isinstance(val, str) and val.startswith("0x") and all(c in '0123456789abcdefABCDEF' for c in val[2:]):
+                return val
+        return self._rpc_call("eth_call", [{"to": address, "data": calldata}, "latest"])
+
     def _rpc_call(self, method: str, params: list) -> Optional[str]:
         """Direct JSON-RPC call via public RPC endpoint (fallback for non-Ethereum chains)."""
         if not self.rpc_url:
@@ -1487,6 +1579,15 @@ class ChainClient:
             if isinstance(val, str) and val.startswith("0x") and all(c in '0123456789abcdefABCDEF' for c in val[2:]):
                 return val
         return self._rpc_call("eth_getStorageAt", [address, slot, "latest"])
+
+    def get_code(self, address: str) -> Optional[str]:
+        """Read deployed bytecode via RPC-compatible endpoints."""
+        data = self._request("proxy", "eth_getCode", address=address, tag="latest")
+        if "result" in data and not data.get("error"):
+            val = data["result"]
+            if isinstance(val, str) and val.startswith("0x"):
+                return val
+        return self._rpc_call("eth_getCode", [address, "latest"])
 
     def check_proxy_initialized(self, address: str) -> dict:
         """Check if proxy is initialized by reading beacon/implementation slots."""
@@ -1912,6 +2013,9 @@ class SourceAnalyzer:
         self._analyze_flash_loan_arbitrage()
         self._analyze_mev_sandwich()
 
+        # Uniswap v4 hook-specific patterns (cross-pool state, fee unit mismatch)
+        self._analyze_v4_hook_patterns()
+
         return self.findings
     
     def _check_known_vulnerabilities(self):
@@ -2013,7 +2117,8 @@ class SourceAnalyzer:
                         recommendation=vuln["recommendation"],
                         line_number=line_num,
                         code_snippet=snippet,
-                        confidence=confidence
+                        confidence=confidence,
+                        vuln_score=compute_vuln_score(vuln_id, vuln["severity"]),
                     ))
     
     def _extract_contract_name(self) -> Optional[str]:
@@ -2429,6 +2534,50 @@ class SourceAnalyzer:
 
     def _analyze_upgrade_patterns(self):
         """Analyze upgradeability patterns with PROTECTION-FIRST approach."""
+        uups_present = bool(re.search(r"UUPSUpgradeable|upgradeTo(?:AndCall)?\s*\(", self.source))
+
+        if uups_present:
+            auth_match = re.search(
+                r"function\s+_authorizeUpgrade\s*\([^)]*\)\s*internal(?:\s+override)?(?P<modifiers>[^\{]*)\{",
+                self.source,
+                re.IGNORECASE,
+            )
+            if auth_match:
+                modifiers = auth_match.group("modifiers")
+                auth_line = self.source[:auth_match.start()].count("\n") + 1
+                shared_admin_guard = None
+
+                if re.search(r"onlyRole\s*\(\s*DEFAULT_ADMIN_ROLE\s*\)", modifiers):
+                    shared_admin_guard = "DEFAULT_ADMIN_ROLE"
+                elif re.search(r"onlyOwner", modifiers):
+                    shared_admin_guard = "owner"
+                elif re.search(r"onlyAdmin", modifiers):
+                    shared_admin_guard = "admin"
+
+                if shared_admin_guard:
+                    privileged_ops = re.findall(
+                        r"function\s+(pause|unpause|deactivate|activate|emergencyWithdraw|setWhitelist|blacklist|unblacklist|grantRole|revokeRole)\s*\([^)]*\)[^{;]*(?:onlyRole\s*\(\s*DEFAULT_ADMIN_ROLE\s*\)|onlyOwner|onlyAdmin)",
+                        self.source,
+                        re.IGNORECASE,
+                    )
+                    unique_ops = sorted({op for op in privileged_ops})
+
+                    if unique_ops:
+                        self.findings.append(Finding(
+                            id="UPGRADE-AUTH-001",
+                            severity=Severity.INFO,
+                            category=Category.UPGRADE,
+                            title="UUPS Upgrade Authority Shares Operational Admin Surface",
+                            description=(
+                                f"Upgradeable contract uses {shared_admin_guard} to authorize implementation upgrades and also gates operational "
+                                f"functions with the same authority ({', '.join(unique_ops[:4])}). A compromise of that authority can change code "
+                                "and disable or distort recovery paths."
+                            ),
+                            recommendation="Review whether upgrade authority should be separated from operational admin authority, ideally with a timelock or multisig and explicit emergency-path testing.",
+                            line_number=auth_line,
+                            confidence=0.8,
+                            vuln_score=compute_vuln_score("UPGRADE-AUTH-001", Severity.INFO),
+                        ))
         
         # ========================================
         # PROTECTION-FIRST: Check global init protections
@@ -2748,6 +2897,176 @@ class SourceAnalyzer:
                 recommendation=r["recommendation"],
                 confidence=0.55,
             ))
+
+    # ===================================================
+    # UNISWAP V4 HOOK PATTERNS
+    # ===================================================
+    # Two cross-function bug classes the regex KNOWN_VULNERABILITIES engine
+    # cannot express:
+    #   HOOK-001 — non-mapping storage var read/written in before*Swap /
+    #              after*Swap bodies. Hook permissions in v4 are encoded in
+    #              the hook ADDRESS, not the PoolKey, so any external party
+    #              can spin up a side pool that reuses the same hook and
+    #              poison shared state.
+    #   HOOK-002 — fee computed from `params.amountSpecified` and then taken
+    #              via `poolManager.take(currencyN, ..., fee)` without any
+    #              decimals/price conversion between the specified and
+    #              unspecified currency. DoSes any non-equal-value pair.
+
+    _HOOK_FN_RE = re.compile(
+        r"function\s+(beforeSwap|afterSwap|beforeAddLiquidity|afterAddLiquidity|"
+        r"beforeRemoveLiquidity|afterRemoveLiquidity|beforeDonate|afterDonate)\s*\(",
+        re.IGNORECASE,
+    )
+    _STATE_VAR_DECL_RE = re.compile(
+        # `<type> [public/private/internal] <name>;` — excludes constants,
+        # immutables, and explicit mappings.
+        r"^\s*(?!mapping\b)(?!using\b)([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+"
+        r"(?:public\s+|private\s+|internal\s+|external\s+)?"
+        r"(?!constant\s)(?!immutable\s)"
+        r"([A-Za-z_]\w*)\s*(?:=[^;]*)?;",
+        re.MULTILINE,
+    )
+    _DECIMAL_CONVERSION_RE = re.compile(
+        r"\.decimals\s*\(|sqrtPriceX96|getQuote|consult|TickMath|FullMath",
+        re.IGNORECASE,
+    )
+
+    def _extract_function_body(self, source: str, start_idx: int) -> Optional[str]:
+        """Return the brace-balanced body starting at the first `{` after start_idx."""
+        brace = source.find("{", start_idx)
+        if brace == -1:
+            return None
+        depth = 0
+        i = brace
+        while i < len(source):
+            c = source[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[brace:i + 1]
+            i += 1
+        return None
+
+    def _analyze_v4_hook_patterns(self):
+        """Detect HOOK-001 (cross-pool state contamination) and HOOK-002
+        (fee currency-unit mismatch) in Uniswap v4 hooks."""
+        if "BaseHook" not in self.source and "IHooks" not in self.source \
+                and not self._HOOK_FN_RE.search(self.source):
+            return  # Not a v4 hook
+
+        # ---- Build set of non-mapping contract-level state variable names ----
+        non_mapping_state: Dict[str, int] = {}
+        for m in self._STATE_VAR_DECL_RE.finditer(self.source):
+            type_tok = m.group(1)
+            name_tok = m.group(2)
+            # Skip type aliases that are clearly local-scope usages
+            if type_tok in {"return", "if", "for", "while", "emit", "require", "revert"}:
+                continue
+            line_num = self.source[:m.start()].count("\n") + 1
+            non_mapping_state[name_tok] = line_num
+
+        # Iterate hook entrypoints
+        for fn_match in self._HOOK_FN_RE.finditer(self.source):
+            fn_name = fn_match.group(1)
+            body = self._extract_function_body(self.source, fn_match.end())
+            if not body:
+                continue
+            body_line = self.source[:fn_match.start()].count("\n") + 1
+
+            # ---------- HOOK-001: non-mapping storage write inside hook ----------
+            for var_name, decl_line in non_mapping_state.items():
+                # Look for assignment to this variable inside the body
+                # (excluding read-only references). We also exclude tstore-only
+                # patterns (transient storage), since those are scoped to one
+                # tx by construction.
+                write_re = re.compile(rf"\b{re.escape(var_name)}\s*(?:\[[^\]]*\])?\s*="
+                                      r"(?!=)")
+                if not write_re.search(body):
+                    continue
+                # Skip `lastSwapBlock = block.number` style block-scoped guards
+                # only if they are read-only inside the hook (they're not — the
+                # write itself is the contamination vector).
+                self.findings.append(Finding(
+                    id="HOOK-001",
+                    severity=Severity.MEDIUM,
+                    category=Category.ORACLE,
+                    title="Hook stores non-pool-keyed state across PoolKeys",
+                    description=(
+                        f"`{fn_name}` writes to contract-level variable "
+                        f"`{var_name}` that is not keyed by PoolId. In Uniswap v4, "
+                        f"hook permissions are encoded in the hook address, not "
+                        f"in the PoolKey, so anyone can initialize a side pool "
+                        f"that reuses this hook and poisons `{var_name}` for the "
+                        f"canonical pool."
+                    ),
+                    recommendation=(
+                        f"Convert `{var_name}` to `mapping(PoolId => ...)` keyed "
+                        f"by `key.toId()`, or hard-bind the hook to a single "
+                        f"authorized PoolId set at deploy time."
+                    ),
+                    line_number=body_line,
+                    code_snippet=self._get_snippet(body_line, 2),
+                    confidence=0.7,
+                    vuln_score=compute_vuln_score("HOOK-001", Severity.MEDIUM),
+                ))
+
+            # ---------- HOOK-002: fee unit mismatch ----------
+            if fn_name.lower() == "beforeswap":
+                # Look for fee computation derived from amountSpecified
+                fee_calc = re.search(
+                    r"(?:amountIn|amount0|amount1|specified)\s*[\.\*\(]"
+                    r"[^;]*(?:HOOK_FEE_BPS|FEE_BPS|fee[A-Z]*Bps|/\s*BPS_DENOMINATOR|/\s*10000)",
+                    body, re.IGNORECASE,
+                )
+                if not fee_calc:
+                    continue
+                # Look for a `currency` selector that depends on `zeroForOne` /
+                # `exactInput` and is then used by afterSwap's poolManager.take.
+                # Simplest signal: the source has `poolManager.take(` AND
+                # `currency1` (or `currency0`) selected by zeroForOne, AND no
+                # decimals / sqrtPrice conversion of the fee value.
+                if "poolManager.take(" not in self.source and \
+                        "PoolManager.take(" not in self.source:
+                    continue
+                # Look for currency selection in the hook body
+                if not re.search(r"key\.currency[01]", body):
+                    continue
+                # Bail out if we see explicit conversion (decimals(), TickMath,
+                # FullMath, sqrtPriceX96 math) — likely an honest implementation.
+                if self._DECIMAL_CONVERSION_RE.search(body):
+                    continue
+
+                line = body_line + body[:fee_calc.start()].count("\n")
+                self.findings.append(Finding(
+                    id="HOOK-002",
+                    severity=Severity.HIGH,
+                    category=Category.LOGIC,
+                    title="Hook fee uses specified-currency units, taken in unspecified currency",
+                    description=(
+                        "Fee is computed as `amountSpecified * BPS / DENOMINATOR` "
+                        "in the SPECIFIED currency's raw units, then later taken "
+                        "via `poolManager.take(unspecifiedCurrency, ..., fee)`. "
+                        "When the two currencies have different decimals or "
+                        "value (e.g. WETH/USDC: 18 vs 6 decimals, ~3000:1 value), "
+                        "the take() call demands orders-of-magnitude more than "
+                        "the pool can provide and reverts — DoSing every swap. "
+                        "The project's tests only cover same-decimal mocks so "
+                        "this class of bug is not exercised."
+                    ),
+                    recommendation=(
+                        "Compute the fee from the unspecified leg of the "
+                        "BalanceDelta passed into afterSwap, OR convert the "
+                        "specified-currency fee into unspecified-currency units "
+                        "using sqrtPriceX96 / decimals() before calling take()."
+                    ),
+                    line_number=line,
+                    code_snippet=self._get_snippet(line, 3),
+                    confidence=0.6,
+                    vuln_score=compute_vuln_score("HOOK-002", Severity.HIGH),
+                ))
 
 
 # ===================================================

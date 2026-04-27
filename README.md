@@ -79,6 +79,12 @@ Validates that every state assumption made in modifiers and guards is actually e
 - `ISAV: ∀ state_assumption A in modifier M, ∃ initializer I such that I guarantees A`
 - Catches cases where a modifier assumes a condition (like `whitelist != address(0)`), but nothing in the contract lifecycle ever guarantees it was properly set up.
 
+### 12. **UUPS/Admin Compromise Detector**
+Flags upgradeable contracts where the same authority controls both `_authorizeUpgrade()` and operational recovery surfaces:
+- Detects `UUPSUpgradeable` + `_authorizeUpgrade()` guarded by `DEFAULT_ADMIN_ROLE`, `onlyOwner`, or `onlyAdmin`
+- Correlates that authority with functions like `pause()`, `deactivate()`, `setWhitelist()`, `grantRole()`, and related emergency/admin paths
+- Prioritizes manual review of blast radius where one compromised admin can both replace implementation code and break recovery mechanisms
+
 ---
 
 ## Quick Comparison
@@ -198,7 +204,7 @@ docker compose up -d
 | `GET` | `/chains` | Supported chains (ethereum, arbitrum, polygon, bsc, optimism, base, avalanche) |
 | `GET` | `/pricing` | Tier information |
 | `GET` | `/usage` | Current rate limit usage |
-| `GET` | `/triage/<address>?chain=ethereum` | Fast plain-English risk triage with capability flags (mintable, pausable, blacklist, upgradeable, ownership) |
+| `GET` | `/triage/<address>?chain=ethereum` | Fast plain-English risk triage with capability flags plus live admin snapshot data (owner, proxy admin, AccessControl admin holders when enumerable) |
 | `GET` | `/audit/<address>?chain=ethereum&full=false` | Audit on-chain contract |
 | `POST` | `/audit/batch` | Batch audit (enterprise) |
 | `POST` | `/compare` | Compare two contracts |
@@ -262,7 +268,11 @@ curl -X POST http://localhost:8080/targets \
 `/triage` response includes UI-ready fields:
 - `summary_labels`: short chips like `Risk:HIGH`, `Upgradeable`, `Mintable`
 - `risk_badges`: structured badges with `label`, `severity`, and `reason`
-- `flags`: capability booleans (`mintable`, `pausable`, `blacklist_capability`, `owner_controlled`, `upgradeable`, etc.)
+- `flags`: capability booleans (`mintable`, `pausable`, `blacklist_capability`, `owner_controlled`, `upgradeable`, `live_eoa_admin`, etc.)
+- `bounty_triage_status`: one of `submission_ready`, `found_candidate`, or `likely_not_in_scope`
+- `live_admin_snapshot`: on-chain authority snapshot including `owner`, `proxy_admin`, `default_admin_role_holders`, and EOA/contract classification when resolvable
+- `risk.top_vuln_score`: highest vulnerability score in the current finding set (0.0-2.5)
+- `prominent_warnings[*].vuln_score`: per-finding vulnerability score (0.0-2.5)
 
 `/audit` score output includes `scores.rating_breakdown` for explainability:
 - `contract_profile`: `STANDARD` or `INFRA_LIKE` (router/factory/pair/pool-style contracts)

@@ -219,6 +219,7 @@ class RepoScanner:
                 else:
                     findings = self._analyze_source(source, source_file)
                     findings.extend(self._analyze_novel_per_file(source, source_file))
+                    findings.extend(self._analyze_v4_hook_patterns(source, source_file))
                 return source_file, source, findings
 
             # ThreadPoolExecutor: regex is GIL-bound but file I/O + any subprocess
@@ -828,6 +829,178 @@ class RepoScanner:
                         "code_snippet": snippet,
                         "confidence": 0.8,
                     })
+
+        return findings
+
+    def _analyze_v4_hook_patterns(self, source: str, sol_file: SolidityFile) -> List[Dict]:
+        """Detect Uniswap v4 hook bug classes the regex KNOWN_VULNERABILITIES
+        engine cannot express:
+
+          HOOK-001 — non-mapping storage var written from a hook entrypoint
+                     (cross-pool state contamination via shared hook address).
+          HOOK-002 — fee derived from `params.amountSpecified` then taken via
+                     `poolManager.take(unspecifiedCurrency, ..., fee)` without
+                     a decimals/sqrtPrice conversion (cross-decimal DoS).
+        """
+        if "BaseHook" not in source and "IHooks" not in source \
+                and "beforeSwap" not in source and "afterSwap" not in source:
+            return []
+
+        try:
+            from advanced_auditor import compute_vuln_score, Severity
+        except Exception:
+            return []
+
+        hook_fn_re = re.compile(
+            r"function\s+(beforeSwap|afterSwap|beforeAddLiquidity|afterAddLiquidity|"
+            r"beforeRemoveLiquidity|afterRemoveLiquidity|beforeDonate|afterDonate)\s*\(",
+            re.IGNORECASE,
+        )
+        if not hook_fn_re.search(source):
+            return []
+
+        # Non-mapping, non-constant, non-immutable contract-level storage
+        # variable declarations. Visibility keyword required to avoid
+        # picking up local variables inside function bodies.
+        state_decl_re = re.compile(
+            r"^\s{0,4}"
+            r"([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+"
+            r"(public|private|internal|external)\s+"
+            r"(?!constant\s)(?!immutable\s)"
+            r"([A-Za-z_]\w*)\s*(?:=[^;]*)?;",
+            re.MULTILINE,
+        )
+        # Bail-out for HOOK-002 only fires when the fee value is itself
+        # multiplied / divided by a price quote. A passing reference to
+        # `sqrtPriceX96` elsewhere in the body (e.g. a volatility check on
+        # `lastSqrtPriceX96`) is not a conversion and must not suppress.
+        decimal_conversion_re = re.compile(
+            r"\.decimals\s*\(|TickMath\.|FullMath\.|getQuote\(",
+            re.IGNORECASE,
+        )
+
+        non_mapping_state: Dict[str, int] = {}
+        for m in state_decl_re.finditer(source):
+            type_tok = m.group(1)
+            name_tok = m.group(3)
+            if type_tok in {"function", "event", "error", "modifier",
+                            "struct", "enum", "return", "if", "for",
+                            "while", "emit", "require", "revert", "assembly",
+                            "using", "mapping"}:
+                continue
+            line_num = source[:m.start()].count("\n") + 1
+            non_mapping_state[name_tok] = line_num
+
+        def _extract_body(start_idx: int) -> Optional[str]:
+            brace = source.find("{", start_idx)
+            if brace == -1:
+                return None
+            depth = 0
+            for i in range(brace, len(source)):
+                c = source[i]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return source[brace:i + 1]
+            return None
+
+        findings: List[Dict] = []
+        lines = source.split("\n")
+        emitted_hook001: set = set()
+        emitted_hook002: bool = False
+
+        for fn_match in hook_fn_re.finditer(source):
+            fn_name = fn_match.group(1)
+            body = _extract_body(fn_match.end())
+            if not body:
+                continue
+            body_line = source[:fn_match.start()].count("\n") + 1
+
+            # HOOK-001: writes to non-mapping contract-level storage from hook
+            for var_name in non_mapping_state:
+                if var_name in emitted_hook001:
+                    continue
+                write_re = re.compile(
+                    rf"\b{re.escape(var_name)}\s*(?:\[[^\]]*\])?\s*=(?!=)"
+                )
+                if not write_re.search(body):
+                    continue
+                start = max(0, body_line - 2)
+                end = min(len(lines), body_line + 3)
+                snippet = "\n".join(lines[start:end])
+                findings.append({
+                    "id": "HOOK-001",
+                    "severity": "MEDIUM",
+                    "severity_weight": 40,
+                    "category": "Oracle Manipulation",
+                    "title": "Hook stores non-pool-keyed state across PoolKeys",
+                    "description": (
+                        f"`{fn_name}` writes to contract-level variable "
+                        f"`{var_name}` that is not keyed by PoolId. In Uniswap v4, "
+                        f"hook permissions are encoded in the hook address, not "
+                        f"in the PoolKey, so anyone can initialize a side pool "
+                        f"that reuses this hook and poisons `{var_name}` for the "
+                        f"canonical pool."
+                    ),
+                    "recommendation": (
+                        f"Convert `{var_name}` to `mapping(PoolId => ...)` keyed "
+                        f"by `key.toId()`, or hard-bind the hook to a single "
+                        f"authorized PoolId at deploy time."
+                    ),
+                    "file": sol_file.path,
+                    "line_number": body_line,
+                    "code_snippet": snippet,
+                    "confidence": 0.7,
+                    "vuln_score": compute_vuln_score("HOOK-001", Severity.MEDIUM),
+                })
+                emitted_hook001.add(var_name)
+
+            # HOOK-002: fee unit mismatch (only need one site to fire)
+            if not emitted_hook002 and fn_name.lower() == "beforeswap":
+                fee_calc = re.search(
+                    r"(?:amountIn|amount0|amount1|specified)\s*[\.\*\(]"
+                    r"[^;]*(?:HOOK_FEE_BPS|FEE_BPS|fee[A-Z]*Bps|/\s*BPS_DENOMINATOR|/\s*10000)",
+                    body, re.IGNORECASE,
+                )
+                if fee_calc \
+                        and ("poolManager.take(" in source or "PoolManager.take(" in source) \
+                        and re.search(r"key\.currency[01]", body) \
+                        and not decimal_conversion_re.search(body):
+                    line = body_line + body[:fee_calc.start()].count("\n")
+                    start = max(0, line - 3)
+                    end = min(len(lines), line + 4)
+                    snippet = "\n".join(lines[start:end])
+                    findings.append({
+                        "id": "HOOK-002",
+                        "severity": "HIGH",
+                        "severity_weight": 60,
+                        "category": "Business Logic",
+                        "title": "Hook fee uses specified-currency units, taken in unspecified currency",
+                        "description": (
+                            "Fee is computed as `amountSpecified * BPS / DENOMINATOR` "
+                            "in the SPECIFIED currency's raw units, then later taken "
+                            "via `poolManager.take(unspecifiedCurrency, ..., fee)`. "
+                            "When the two currencies have different decimals or "
+                            "value (e.g. WETH/USDC: 18 vs 6 decimals, ~3000:1 value), "
+                            "the take() call demands orders of magnitude more than "
+                            "the pool can provide and reverts — DoSing every swap. "
+                            "Project tests using same-decimal mocks do not exercise this."
+                        ),
+                        "recommendation": (
+                            "Compute the fee from the unspecified leg of the "
+                            "BalanceDelta passed into afterSwap, OR convert the "
+                            "specified-currency fee into unspecified-currency units "
+                            "using sqrtPriceX96 / decimals() before calling take()."
+                        ),
+                        "file": sol_file.path,
+                        "line_number": line,
+                        "code_snippet": snippet,
+                        "confidence": 0.6,
+                        "vuln_score": compute_vuln_score("HOOK-002", Severity.HIGH),
+                    })
+                    emitted_hook002 = True
 
         return findings
 

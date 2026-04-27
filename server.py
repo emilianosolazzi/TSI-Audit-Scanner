@@ -14,6 +14,11 @@ from datetime import datetime, timedelta
 from functools import wraps
 from typing import Dict, Optional, Any, List
 
+try:
+    from Crypto.Hash import keccak
+except ImportError:
+    keccak = None
+
 # Flask
 try:
     from flask import Flask, jsonify, request, g
@@ -289,6 +294,129 @@ def _build_capability_flags(report, abi: Optional[List[Dict[str, Any]]]) -> Dict
     }
 
 
+EIP1967_ADMIN_SLOT = "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103"
+DEFAULT_ADMIN_ROLE = "0x" + "0" * 64
+
+
+def _selector(signature: str) -> Optional[str]:
+    if keccak is None:
+        return None
+    return "0x" + keccak.new(digest_bits=256, data=signature.encode()).hexdigest()[:8]
+
+
+def _encode_uint256(value: int) -> str:
+    return f"{value:064x}"
+
+
+def _encode_bytes32(value: str) -> str:
+    hex_value = value[2:] if value.startswith("0x") else value
+    return hex_value.rjust(64, "0")
+
+
+def _encode_address(address: str) -> str:
+    return address.lower().replace("0x", "").rjust(64, "0")
+
+
+def _decode_address(result: Optional[str]) -> Optional[str]:
+    if not result or result == "0x":
+        return None
+    clean = result[2:] if result.startswith("0x") else result
+    if len(clean) < 40:
+        return None
+    address = "0x" + clean[-40:]
+    if re.fullmatch(r"0x0{40}", address):
+        return None
+    return address.lower()
+
+
+def _decode_uint256(result: Optional[str]) -> Optional[int]:
+    if not result or result == "0x":
+        return None
+    try:
+        return int(result, 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def _decode_bool(result: Optional[str]) -> Optional[bool]:
+    value = _decode_uint256(result)
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _classify_address_type(client: ChainClient, address: Optional[str]) -> Optional[str]:
+    if not address:
+        return None
+    code = client.get_code(address)
+    if not code:
+        return None
+    return "contract" if code not in {"0x", "0x0"} else "eoa"
+
+
+def _build_live_admin_snapshot(client: ChainClient, report, abi: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Build a lightweight live snapshot of upgrade/admin authority on-chain."""
+    function_names = _extract_abi_function_names(abi)
+    lowered = {name.lower() for name in function_names}
+    state_address = (report.metadata.address or "").lower()
+
+    snapshot: Dict[str, Any] = {
+        "state_address": state_address,
+        "implementation_address": report.metadata.implementation,
+        "proxy_admin": None,
+        "proxy_admin_type": None,
+        "owner": None,
+        "owner_type": None,
+        "creator": report.metadata.creator.lower() if report.metadata.creator else None,
+        "creator_type": None,
+        "default_admin_role_member_count": None,
+        "default_admin_role_holders": [],
+        "creator_has_default_admin_role": None,
+    }
+
+    if snapshot["creator"]:
+        snapshot["creator_type"] = _classify_address_type(client, snapshot["creator"])
+
+    if report.metadata.proxy:
+        proxy_admin_raw = client.get_storage_at(state_address, EIP1967_ADMIN_SLOT)
+        snapshot["proxy_admin"] = _decode_address(proxy_admin_raw)
+        snapshot["proxy_admin_type"] = _classify_address_type(client, snapshot["proxy_admin"])
+
+    if "owner" in lowered:
+        snapshot["owner"] = _decode_address(client.call_function(state_address, "0x8da5cb5b"))
+    elif "getowner" in lowered:
+        snapshot["owner"] = _decode_address(client.call_function(state_address, "0x893d20e8"))
+    snapshot["owner_type"] = _classify_address_type(client, snapshot["owner"])
+
+    has_role_selector = _selector("hasRole(bytes32,address)")
+    get_role_member_count_selector = _selector("getRoleMemberCount(bytes32)")
+    get_role_member_selector = _selector("getRoleMember(bytes32,uint256)")
+
+    if "getrolemembercount" in lowered and get_role_member_count_selector and get_role_member_selector:
+        calldata = get_role_member_count_selector + _encode_bytes32(DEFAULT_ADMIN_ROLE)
+        member_count = _decode_uint256(client.call_function_data(state_address, calldata))
+        snapshot["default_admin_role_member_count"] = member_count
+        if member_count:
+            for index in range(min(member_count, 3)):
+                member_call = (
+                    get_role_member_selector
+                    + _encode_bytes32(DEFAULT_ADMIN_ROLE)
+                    + _encode_uint256(index)
+                )
+                holder = _decode_address(client.call_function_data(state_address, member_call))
+                if holder:
+                    snapshot["default_admin_role_holders"].append({
+                        "address": holder,
+                        "type": _classify_address_type(client, holder),
+                    })
+
+    if snapshot["creator"] and "hasrole" in lowered and has_role_selector:
+        calldata = has_role_selector + _encode_bytes32(DEFAULT_ADMIN_ROLE) + _encode_address(snapshot["creator"])
+        snapshot["creator_has_default_admin_role"] = _decode_bool(client.call_function_data(state_address, calldata))
+
+    return snapshot
+
+
 def _build_summary_labels(flags: Dict[str, Any], risk_level: str) -> List[str]:
     """Build short UI labels for quick scan cards/tables."""
     labels: List[str] = [f"Risk:{risk_level}"]
@@ -309,6 +437,8 @@ def _build_summary_labels(flags: Dict[str, Any], risk_level: str) -> List[str]:
         labels.append("BlacklistCapable")
     if flags.get("admin_surface_present"):
         labels.append("AdminSurface")
+    if flags.get("live_eoa_admin"):
+        labels.append("EOAAdmin")
 
     return labels
 
@@ -336,6 +466,7 @@ def _build_risk_badges(flags: Dict[str, Any], risk_level: str) -> List[Dict[str,
         ("mintable", "Mintable", "medium", "Token supply expansion capability"),
         ("pausable", "Pausable", "low", "Transfer/function pause capability"),
         ("blacklist_capability", "Blacklist Capability", "high", "Address blocking/freeze semantics present"),
+        ("live_eoa_admin", "Live EOA Admin", "high", "Live on-chain admin authority appears to be held by an EOA"),
     ]
 
     for key, label, severity, reason in badge_rules:
@@ -345,7 +476,7 @@ def _build_risk_badges(flags: Dict[str, Any], risk_level: str) -> List[Dict[str,
     return badges
 
 
-def _build_triage_response(report, abi: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def _build_triage_response(report, abi: Optional[List[Dict[str, Any]]] = None, live_admin_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build a fast, plain-English contract triage view from a full audit report."""
     report_data = report.to_dict()
     contract = report_data["contract"]
@@ -354,7 +485,11 @@ def _build_triage_response(report, abi: Optional[List[Dict[str, Any]]] = None) -
     analysis = report_data["analysis"]
     findings = sorted(
         report_data["findings"],
-        key=lambda finding: (-_severity_rank(finding.get("severity", "INFO")), -finding.get("confidence", 0)),
+        key=lambda finding: (
+            -finding.get("vuln_score", 0),
+            -_severity_rank(finding.get("severity", "INFO")),
+            -finding.get("confidence", 0),
+        ),
     )
 
     prominent_warnings: List[Dict[str, Any]] = []
@@ -366,11 +501,14 @@ def _build_triage_response(report, abi: Optional[List[Dict[str, Any]]] = None) -
             "severity": finding.get("severity"),
             "title": finding.get("title"),
             "category": finding.get("category"),
+            "vuln_score": finding.get("vuln_score", 0.0),
             "why_it_matters": finding.get("description"),
             "recommendation": finding.get("recommendation"),
         })
         if len(prominent_warnings) >= 5:
             break
+
+    top_vuln_score = findings[0].get("vuln_score", 0.0) if findings else 0.0
 
     flags = {
         "verified_source": contract.get("verified", False),
@@ -384,6 +522,20 @@ def _build_triage_response(report, abi: Optional[List[Dict[str, Any]]] = None) -
         "unverified_contract": not contract.get("verified", False),
     }
     flags.update(_build_capability_flags(report, abi))
+    role_holders = (live_admin_snapshot or {}).get("default_admin_role_holders", [])
+    eoa_role_holder = any(holder.get("type") == "eoa" for holder in role_holders)
+    live_eoa_admin = any(
+        admin_type == "eoa"
+        for admin_type in [
+            (live_admin_snapshot or {}).get("owner_type"),
+            (live_admin_snapshot or {}).get("proxy_admin_type"),
+            (live_admin_snapshot or {}).get("creator_type") if (live_admin_snapshot or {}).get("creator_has_default_admin_role") else None,
+        ]
+    ) or eoa_role_holder
+    flags.update({
+        "live_admin_snapshot_available": bool(live_admin_snapshot),
+        "live_eoa_admin": live_eoa_admin,
+    })
     summary_labels = _build_summary_labels(flags, scores["risk_level"])
     risk_badges = _build_risk_badges(flags, scores["risk_level"])
 
@@ -391,6 +543,8 @@ def _build_triage_response(report, abi: Optional[List[Dict[str, Any]]] = None) -
         verdict = "Avoid interacting until the critical issues are reviewed."
     elif scores["risk_level"] == "HIGH":
         verdict = "High-risk contract. Manual review is required before use or integration."
+    elif flags.get("live_eoa_admin") and (flags.get("upgradeable") or flags.get("role_controlled") or flags.get("admin_surface_present")):
+        verdict = "Live on-chain admin authority appears EOA-held on a privileged control surface. Treat this as a high-priority manual review candidate."
     elif flags.get("unverified_contract") and (flags.get("upgradeable") or flags.get("owner_controlled")):
         verdict = "Caution: this contract is unverified and has privileged control/upgrade surface. Review thoroughly before interacting."
     elif scores["risk_level"] == "MEDIUM":
@@ -400,13 +554,32 @@ def _build_triage_response(report, abi: Optional[List[Dict[str, Any]]] = None) -
     else:
         verdict = "No severe risk signal was detected in the quick scan, but this is not a substitute for a full audit."
 
+    # ---- bounty triage status ----
+    risk_level = scores["risk_level"]
+    if (
+        flags.get("live_eoa_admin")
+        and flags.get("live_admin_snapshot_available")
+        and (flags.get("upgradeable") or flags.get("role_controlled"))
+        and risk_level in {"CRITICAL", "HIGH"}
+    ):
+        bounty_triage_status = "submission_ready"
+    elif (
+        risk_level in {"CRITICAL", "HIGH", "MEDIUM"}
+        or flags.get("live_eoa_admin")
+    ):
+        bounty_triage_status = "found_candidate"
+    else:
+        bounty_triage_status = "likely_not_in_scope"
+
     return {
         "timestamp": report_data["timestamp"],
         "contract": contract,
+        "bounty_triage_status": bounty_triage_status,
         "quick_verdict": verdict,
         "risk": {
             "security_score": scores["security_score"],
             "risk_level": scores["risk_level"],
+            "top_vuln_score": top_vuln_score,
             "total_findings": summary["total_findings"],
             "critical": summary["critical"],
             "high": summary["high"],
@@ -415,6 +588,7 @@ def _build_triage_response(report, abi: Optional[List[Dict[str, Any]]] = None) -
         "summary_labels": summary_labels,
         "risk_badges": risk_badges,
         "flags": flags,
+        "live_admin_snapshot": live_admin_snapshot or {},
         "surface": {
             "total_functions": analysis.get("functions", {}).get("total", 0),
             "external_functions": analysis.get("functions", {}).get("external", 0),
@@ -656,7 +830,8 @@ def triage_contract(address: str):
         report = auditor.audit(address)
         triage_address = report.metadata.implementation or address.lower()
         abi = auditor.client.get_contract_abi(triage_address)
-        return jsonify(_build_triage_response(report, abi))
+        live_admin_snapshot = _build_live_admin_snapshot(auditor.client, report, abi)
+        return jsonify(_build_triage_response(report, abi, live_admin_snapshot))
     except ValueError as e:
         return jsonify({"error": "Invalid input", "message": str(e)}), 400
     except Exception as e:
